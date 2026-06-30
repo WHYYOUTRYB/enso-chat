@@ -113,26 +113,22 @@ def _resolve_enso_data(
     return enso, {"requested": data_source, "used": "sample", "fallback_reason": None}
 
 
-def run_enso_forecast(
-    base_dir: Path | None = None,
-    data_source: str = "auto",
-    refresh_noaa: bool = False,
-) -> EnsoForecastOutput:
-    if base_dir is None:
-        sample_dir = SAMPLE_DATA_DIR
-        outputs_dir = OUTPUTS_DIR
-    else:
-        sample_dir = base_dir / "data" / "sample"
-        outputs_dir = base_dir / "reports" / "outputs"
+def run_forecast_on_enso(
+    enso: pd.DataFrame,
+    *,
+    outputs_dir: Path,
+    data_source_info: dict,
+) -> tuple[dict, Path, Path]:
+    """Run the ENSO modeling pipeline on an already-loaded ENSO DataFrame.
 
+    Shared by ``run_enso_forecast`` (sample/NOAA) and the ``load_user_enso``
+    tool (user-uploaded CSV). Builds features, trains Persistence + Ridge +
+    RandomForest for 1/3/6-month leads, evaluates, and writes the results
+    JSON + predictions CSV to ``outputs_dir``.
+
+    Returns ``(results, results_path, predictions_path)``.
+    """
     outputs_dir.mkdir(parents=True, exist_ok=True)
-
-    enso, data_source_info = _resolve_enso_data(
-        sample_dir=sample_dir,
-        data_source=data_source,
-        refresh_noaa=refresh_noaa,
-        base_dir=base_dir,
-    )
     table, feature_cols = make_enso_supervised_table(enso, leads=DEFAULT_LEADS, max_lag=12)
     train, test = temporal_train_test_split(table, test_fraction=0.25)
 
@@ -209,6 +205,31 @@ def run_enso_forecast(
 
     results_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     pd.DataFrame(prediction_rows).to_csv(predictions_path, index=False)
+
+    return results, results_path, predictions_path
+
+
+def run_enso_forecast(
+    base_dir: Path | None = None,
+    data_source: str = "auto",
+    refresh_noaa: bool = False,
+) -> EnsoForecastOutput:
+    if base_dir is None:
+        sample_dir = SAMPLE_DATA_DIR
+        outputs_dir = OUTPUTS_DIR
+    else:
+        sample_dir = base_dir / "data" / "sample"
+        outputs_dir = base_dir / "reports" / "outputs"
+
+    enso, data_source_info = _resolve_enso_data(
+        sample_dir=sample_dir,
+        data_source=data_source,
+        refresh_noaa=refresh_noaa,
+        base_dir=base_dir,
+    )
+    results, results_path, predictions_path = run_forecast_on_enso(
+        enso, outputs_dir=outputs_dir, data_source_info=data_source_info
+    )
 
     return EnsoForecastOutput(
         results=results,
