@@ -58,8 +58,20 @@ def _get_messages() -> list[dict]:
 
 
 def _resolve_client(api_key: str):
-    """Return a DeepSeekClient or None (no key -> disabled chat)."""
-    key = (api_key or "").strip() or os.environ.get("DEEPSEEK_API_KEY")
+    """Return a DeepSeekClient or None (no key -> disabled chat).
+
+    Key priority: sidebar input > Streamlit secrets > DEEPSEEK_API_KEY env.
+    The secrets path is for cloud deployment (Streamlit Community Cloud),
+    where there is no shell env var; locally it is absent and falls through.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        try:
+            key = st.secrets.get("DEEPSEEK_API_KEY", "")
+        except Exception:  # noqa: BLE001 — st.secrets raises if no secrets file
+            key = ""
+    if not key:
+        key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not key:
         return None
     try:

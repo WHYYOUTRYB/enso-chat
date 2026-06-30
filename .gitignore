@@ -10,3 +10,4 @@ reports/figures/*.png
 reports/outputs/*.json
 reports/outputs/*.md
 reports/outputs/*.csv
+.streamlit/secrets.toml
