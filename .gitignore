@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+data/raw/
+data/processed/
+data/sample/*.csv
+reports/figures/*.png
+reports/outputs/*.json
+reports/outputs/*.md
+reports/outputs/*.csv
