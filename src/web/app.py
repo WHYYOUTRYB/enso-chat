@@ -68,6 +68,31 @@ def _resolve_client(api_key: str):
         return None
 
 
+def _handle_uploaded_csv(uploaded) -> str | None:
+    """Save an uploaded ENSO CSV to the session temp dir; return its path.
+
+    Returns the saved path (stored on the context so the agent can load it via
+    load_user_enso), or None if nothing was uploaded this run.
+    """
+    if uploaded is None:
+        return None
+    base_dir = _session_base_dir()
+    user_dir = base_dir / "data" / "user"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    path = user_dir / uploaded.name
+    path.write_bytes(uploaded.getvalue())
+    st.session_state["user_csv_path"] = str(path)
+    return str(path)
+
+
+def _new_figures(ctx) -> list[Path]:
+    """Return figures added since the last render (and mark them shown)."""
+    shown = st.session_state.setdefault("shown_figures", set())
+    fresh = [p for p in ctx.figure_paths if str(p) not in shown]
+    shown.update(str(p) for p in fresh)
+    return fresh
+
+
 def main() -> None:
     st.set_page_config(page_title="ENSO 对话 Agent", page_icon="🌊", layout="wide")
     st.title("🌊 ENSO 对话式 Agent")
@@ -76,6 +101,13 @@ def main() -> None:
         st.header("配置")
         api_key = st.text_input("DeepSeek API Key", type="password",
                                 placeholder="留空读环境变量")
+        uploaded = st.file_uploader("上传 ENSO CSV（date+nino34 列）", type=["csv"],
+                                    help="上传后会得到路径，让 agent 用 load_user_enso 加载")
+        if uploaded is not None:
+            path = _handle_uploaded_csv(uploaded)
+            st.success(f"已上传: {Path(path).name}")
+            st.caption(f"路径: {path}")
+            st.caption("在对话里说「用我上传的数据」即可。")
         if st.button("🗑️ 清空对话"):
             st.session_state["messages"] = init_messages(SYSTEM_PROMPT)
             st.rerun()
@@ -85,6 +117,7 @@ def main() -> None:
         st.session_state["ctx"] = ToolContext(base_dir=_session_base_dir())
         st.session_state["tools"] = build_tools(st.session_state["ctx"])
     tools = st.session_state["tools"]
+    ctx = st.session_state["ctx"]
     client = _resolve_client(api_key)
 
     messages = _get_messages()
@@ -130,6 +163,9 @@ def main() -> None:
                 return
         for step_dict in steps_box:
             _render_tool_step(step_dict)
+        # Show any figures produced this turn inline.
+        for fig in _new_figures(ctx):
+            st.image(str(fig), caption=fig.name, use_container_width=True)
         st.markdown(result.final_text or "(无回复)")
         if result.stopped_reason:
             st.caption(f"stopped: {result.stopped_reason}")
