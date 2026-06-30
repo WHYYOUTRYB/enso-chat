@@ -21,11 +21,11 @@ import pandas as pd
 from src.analysis.enso_phase import classify_enso_phase
 from src.analysis.precipitation_analysis import analyze_precipitation_by_enso_phase
 from src.config import DEFAULT_LEADS, FIGURES_DIR, OUTPUTS_DIR, SAMPLE_DATA_DIR
-from src.data.loaders import load_precipitation_csv, load_tide_csv
+from src.data.loaders import load_enso_csv, load_precipitation_csv, load_tide_csv
 from src.features.enso_features import make_enso_supervised_table
 from src.models.enso_ml import build_model_suite, fit_models_for_latest_forecast
 from src.models.tide_model import run_tide_demo_prediction
-from src.pipeline.run_enso_forecast import run_enso_forecast
+from src.pipeline.run_enso_forecast import run_enso_forecast, run_forecast_on_enso
 from src.visualization.plots import (
     plot_enso_phase_timeline,
     plot_enso_rmse_by_model,
@@ -167,6 +167,49 @@ def _enso_summary(ctx: ToolContext, *, cached: bool) -> str:
         f"date_range={ctx.enso['date'].min().date()}_to_{ctx.enso['date'].max().date()}. "
         f"best_model_by_lead={best_json}. "
         f"results={ctx.enso_results_path.as_posix()}, predictions={ctx.predictions_path.as_posix()}"
+    )
+
+
+def _load_user_enso(ctx: ToolContext, path: str) -> str:
+    """Load a user-uploaded ENSO CSV and run the modeling pipeline on it.
+
+    The CSV must have ``date`` and ``nino34`` columns (same format as the
+    sample ENSO data). On success, replaces the ENSO series/results cached on
+    the context so subsequent tools (forecast_for_month, plots, etc.) use the
+    user's data. On any failure (missing file, missing columns, parse error)
+    returns an Error string and leaves the context untouched.
+    """
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return f"Error: file not found: {path}"
+    try:
+        enso = load_enso_csv(csv_path)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if len(enso) < 30:
+        return (
+            f"Error: uploaded ENSO CSV has only {len(enso)} rows; need at least ~30 "
+            f"(2+ years) to train the models."
+        )
+
+    data_source_info = {"requested": "user", "used": "user", "fallback_reason": None}
+    results, results_path, predictions_path = run_forecast_on_enso(
+        enso, outputs_dir=ctx.outputs_dir, data_source_info=data_source_info
+    )
+    ctx.enso_results_path = results_path
+    ctx.predictions_path = predictions_path
+    ctx.results = results
+    ctx.enso_data_source = "user"
+    ctx.enso = enso
+    ctx.predictions = pd.read_csv(predictions_path, parse_dates=["date"])
+
+    best = results["best_model_by_lead"]
+    best_json = json.dumps(best, separators=(",", ":"))
+    return (
+        f"User ENSO data loaded. rows={len(enso)}, "
+        f"date_range={enso['date'].min().date()}_to_{enso['date'].max().date()}. "
+        f"best_model_by_lead={best_json}. "
+        f"results={results_path.as_posix()}, predictions={predictions_path.as_posix()}"
     )
 
 
@@ -521,6 +564,27 @@ def build_tools(ctx: ToolContext) -> ToolRegistry:
                 "additionalProperties": False,
             },
             fn=lambda data_source="sample", refresh_noaa=False: _load_enso_data(ctx, data_source, refresh_noaa),
+        ),
+        Tool(
+            name="load_user_enso",
+            description=(
+                "Load a user-uploaded ENSO CSV (must have 'date' and 'nino34' columns, "
+                "monthly Niño3.4 values) and run the modeling pipeline on it, replacing the "
+                "current ENSO data. Use this when the user has uploaded their own CSV via the "
+                "sidebar. The path is provided by the UI after upload; pass it verbatim."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the uploaded ENSO CSV file (date+nino34 columns).",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            fn=lambda path: _load_user_enso(ctx, path),
         ),
         Tool(
             name="forecast_latest",
