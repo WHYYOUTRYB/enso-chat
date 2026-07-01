@@ -20,8 +20,9 @@ import pandas as pd
 
 from src.analysis.enso_phase import classify_enso_phase
 from src.analysis.precipitation_analysis import analyze_precipitation_by_enso_phase
-from src.config import DEFAULT_LEADS, FIGURES_DIR, OUTPUTS_DIR, SAMPLE_DATA_DIR
+from src.config import ACC_LOW_CONF, ACC_REFUSE, DEFAULT_LEADS, FIGURES_DIR, OUTPUTS_DIR, PROJECT_ROOT, SAMPLE_DATA_DIR
 from src.data.loaders import load_enso_csv, load_precipitation_csv, load_tide_csv
+from src.data.source_registry import IndexLoadError, list_sources, load_index as _registry_load_index
 from src.features.enso_features import make_enso_supervised_table
 from src.models.enso_ml import build_model_suite, fit_models_for_latest_forecast
 from src.models.tide_model import run_tide_demo_prediction
@@ -56,6 +57,14 @@ class ToolContext:
     tide_metrics: dict | None = None
     tide_figure: Path | None = None
     report_path: Path | None = None
+    # CNN-LSTM track (spatial-field model). Kept on a separate slot so it never
+    # overwrites the Ridge/RF results cached on `results`; the two methods coexist.
+    cnn_forecasts: dict | None = None
+    # Enhanced track (Ridge/RF + exogenous SOI/Niño1+2). Separate slot for the
+    # same reason — coexists with the baseline `results` and `cnn_forecasts`.
+    enhanced_results: dict | None = None
+    # Cached exogenous index series loaded via load_index (name -> DataFrame).
+    loaded_indices: dict | None = None
 
     @property
     def figures_dir(self) -> Path:
@@ -343,6 +352,528 @@ def _forecast_value_for_lead(ctx: ToolContext, lead: int) -> dict:
     return {"value": round(value, 4), "phase": classify_enso_phase(value), "model": primary_name}
 
 
+# ---------------------------------------------------------------------------
+# CNN-LSTM track (spatial-field model)
+# ---------------------------------------------------------------------------
+# Second prediction track: a CNN-LSTM trained offline on SODA sst/t300/ua/va
+# spatial fields (see src/models/cnn_lstm.py + scripts/train_cnn_lstm.py). The
+# online tool only does a CPU forward pass. Because real-time spatial fields are
+# not wired up yet, the input window is SODA's tail months — forecasts are
+# labeled as such (not real-time). Coexists with the Ridge/RF track above; the
+# two never share the `results` slot.
+
+CNN_LSTM_WEIGHTS_PATH = PROJECT_ROOT / "weights" / "cnn_lstm_soda.pth"
+SODA_TRAIN_PATH = PROJECT_ROOT / "data" / "SODA_train.nc"
+SODA_LABEL_PATH = PROJECT_ROOT / "data" / "SODA_label.nc"
+HINDCAST_REPORT_PATH = OUTPUTS_DIR / "cnn_lstm_hindcast.json"
+REALTIME_HINDCAST_REPORT_PATH = OUTPUTS_DIR / "cnn_lstm_realtime_hindcast.json"
+
+
+def _forecast_cnn_lstm(ctx: ToolContext, lead: int, mode: str = "soda_tail") -> str:
+    """Run the CNN-LSTM forward pass for one lead (1..24).
+
+    Args:
+        lead: 1..24.
+        mode: ``"soda_tail"`` (default, backward compatible) uses SODA's last
+            window — non-real-time. ``"realtime"`` fetches live sst/t300/ua/va
+            fields from OISST/GODAS/NCEP, anomalizes them against precomputed
+            climatologies, and runs the same model. Realtime results are
+            **cross-domain** (trained SODA / inferred other sources) and must be
+            labeled as such — SODA-hindcast ACC does not transfer.
+
+    Results are cached on ``ctx.cnn_forecasts`` (keyed by mode) so a second call
+    for a different lead reuses the same 24-lead prediction.
+    """
+    if not (1 <= lead <= 24):
+        return f"Error: lead must be 1..24, got {lead}."
+    if mode not in ("soda_tail", "realtime"):
+        return f"Error: mode must be 'soda_tail' or 'realtime', got {mode!r}."
+
+    # Reuse the cached 24-lead prediction if this mode's window has run.
+    if ctx.cnn_forecasts is not None and ctx.cnn_forecasts.get("mode") == mode and "leads" in ctx.cnn_forecasts:
+        leads = ctx.cnn_forecasts["leads"]
+        if str(lead) in leads or lead in leads:
+            entry = leads.get(str(lead)) or leads.get(lead)
+            src = ctx.cnn_forecasts.get("source", "?")
+            we = ctx.cnn_forecasts.get("window_end", "?")
+            return f"lead={lead}: value={entry['value']}, phase={entry['phase']} (CNN-LSTM, cached). source={src}, window_end={we}."
+
+    # Lazy import: torch is a heavy, training-only dep — don't fail `import tools`.
+    try:
+        from src.models.cnn_lstm import load_soda_tail_window, predict_cnn_lstm, predict_cnn_lstm_realtime
+    except ImportError as exc:
+        return f"Error: CNN-LSTM backend unavailable (missing dependency): {exc}"
+
+    if not CNN_LSTM_WEIGHTS_PATH.exists():
+        return (
+            "Error: CNN-LSTM weights not found at "
+            f"{CNN_LSTM_WEIGHTS_PATH.as_posix()}. Train first: python scripts/train_cnn_lstm.py"
+        )
+
+    if mode == "soda_tail":
+        if not SODA_TRAIN_PATH.exists():
+            return f"Error: SODA train data not found: {SODA_TRAIN_PATH.as_posix()}"
+        try:
+            window, window_end = load_soda_tail_window(SODA_TRAIN_PATH)
+            all_leads = predict_cnn_lstm(window, CNN_LSTM_WEIGHTS_PATH)
+        except FileNotFoundError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"Error running CNN-LSTM inference: {exc.__class__.__name__}: {exc}"
+        source = "SODA末端窗口(非实时空间场)"
+        note = "Note: based on SODA reanalysis tail, not real-time spatial fields."
+    else:  # realtime
+        # Check climatologies exist BEFORE fetching (avoids a slow OISST download
+        # only to fail at anomalize time). Climatologies are stored as .npz
+        # (load_climatology rewrites a .nc path to .npz automatically).
+        clim_dir = PROJECT_ROOT / "data" / "processed"
+        clim_names = ["sst", "t300", "uwnd", "vwnd"]
+        missing_clim = [n for n in clim_names
+                        if not (clim_dir / f"{n}_climatology.npz").exists()
+                        and not (clim_dir / f"{n}_climatology.nc").exists()]
+        if missing_clim:
+            return (
+                f"Error: missing climatologies {missing_clim} in {clim_dir.as_posix()}. "
+                "Run: python scripts/build_climatology.py (one-time offline precompute)."
+            )
+        try:
+            from src.data.realtime_fetch import fetch_realtime_window, RealtimeFetchError
+        except ImportError as exc:
+            return f"Error: realtime backend unavailable: {exc}"
+        try:
+            window, window_end, missing = fetch_realtime_window()
+        except RealtimeFetchError as exc:
+            return f"Error: realtime fetch failed: {exc}."
+        except FileNotFoundError as exc:
+            return f"Error: {exc}. Run scripts/build_climatology.py first."
+        except Exception as exc:  # noqa: BLE001
+            return f"Error running realtime fetch: {exc.__class__.__name__}: {exc}"
+        try:
+            all_leads = predict_cnn_lstm_realtime(window, CNN_LSTM_WEIGHTS_PATH)
+        except Exception as exc:  # noqa: BLE001
+            return f"Error running CNN-LSTM realtime inference: {exc.__class__.__name__}: {exc}"
+        source = f"实时空间场(OISST+GODAS+NCEP), data_through={window_end}, cross-domain"
+        if missing:
+            source += f", missing={missing}(degraded)"
+        note = (
+            "Note: REALTIME cross-domain — trained on SODA, inferred on OISST/GODAS/NCEP. "
+            "Precision is lower than SODA hindcast; do NOT apply hindcast ACC here. "
+            "Window cut off at wind channel's latest month (~5-month lag)."
+        )
+
+    ctx.cnn_forecasts = {
+        "mode": mode,
+        "window_end": window_end,
+        "source": source,
+        "leads": {item["lead"]: {"value": item["value"], "phase": item["phase"]} for item in all_leads},
+    }
+    entry = ctx.cnn_forecasts["leads"][lead]
+    guide = ""
+    if mode == "realtime":
+        guide = " [可靠性请调 report_realtime_skill(lead="
+        guide += f"{lead}) 查跨域 ACC，勿用 report_hindcast_skill]"
+    return (
+        f"lead={lead}: value={entry['value']}, phase={entry['phase']} "
+        f"(CNN-LSTM, spatial sst/t300/ua/va, mode={mode}). source={source}. {note}{guide}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Enhanced track: Ridge/RF + exogenous climate indices (SOI, Niño1+2)
+# ---------------------------------------------------------------------------
+# The real-time-capable prediction track. Unlike CNN-LSTM (spatial fields,
+# non-real-time), the exogenous indices are 1-D monthly series downloadable
+# from NOAA/PSL on demand, so enhanced forecasts can genuinely answer "next
+# March". Lead confidence is data-driven from per-lead ACC rather than the
+# hard-coded 7/12 thresholds used by the baseline _forecast_for_month.
+
+EXOG_INDICES = ("soi", "nino12")
+
+
+def _confidence_from_acc(acc: float) -> tuple[str, str]:
+    """Map a per-lead ACC to a (confidence, tag) pair using config thresholds."""
+    if acc < ACC_REFUSE:
+        return "refuse", f" [拒绝/refused: ACC={acc:.2f}<{ACC_REFUSE}, below reliable range]"
+    if acc < ACC_LOW_CONF:
+        return "low_confidence", f" [低可信度/low_confidence: ACC={acc:.2f}<{ACC_LOW_CONF}, indicative only]"
+    return "normal", f" [ACC={acc:.2f}]"
+
+
+def _load_exog_into_ctx(ctx: ToolContext, cache_dir=None) -> tuple[pd.DataFrame, list[str]]:
+    """Load SOI + Niño1+2, merge onto ctx.enso, return (merged_df, available_cols).
+
+    On any index failure, skips that index and continues — the caller reports
+    which exog variables were actually available. ``ctx.enso`` must be loaded
+    first.
+    """
+    if ctx.enso is None:
+        raise RuntimeError("ENSO data not loaded; call load_enso_data first.")
+    if ctx.loaded_indices is None:
+        ctx.loaded_indices = {}
+    merged = ctx.enso.copy()
+    available: list[str] = []
+    for name in EXOG_INDICES:
+        if name in ctx.loaded_indices:
+            idx = ctx.loaded_indices[name]
+        else:
+            try:
+                idx = _registry_load_index(name, cache_dir=cache_dir)
+            except IndexLoadError:
+                continue
+            ctx.loaded_indices[name] = idx
+        if "value" not in idx.columns and name not in idx.columns:
+            # source_registry returns the column named by value_col (= name).
+            pass
+        col = name if name in idx.columns else "value"
+        idx_s = idx[["date", col]].rename(columns={col: name})
+        merged = merged.merge(idx_s, on="date", how="left")
+        if name in merged.columns and merged[name].notna().any():
+            available.append(name)
+    # Forward-fill any trailing gaps from non-overlapping index coverage, then
+    # drop rows still missing exog values (feature construction needs them).
+    for name in available:
+        merged[name] = merged[name].ffill().bfill()
+    return merged, available
+
+
+def _ensure_enhanced_results(ctx: ToolContext) -> str | None:
+    """Run the enhanced pipeline once and cache on ctx.enhanced_results.
+
+    Returns an error string if ENSO data can't be loaded; None on success.
+    Reuses the cached results on repeat calls.
+    """
+    if ctx.enhanced_results is not None:
+        return None
+    if ctx.enso is None or ctx.results is None:
+        _load_enso_data(ctx, data_source="auto", refresh_noaa=False)
+    if ctx.enso is None:
+        return "Error: could not load ENSO data for enhanced forecast."
+
+    try:
+        merged, available = _load_exog_into_ctx(ctx)
+    except Exception as exc:  # noqa: BLE001 — surface to LLM
+        return f"Error loading exogenous indices: {exc.__class__.__name__}: {exc}"
+
+    if not available:
+        # Fall back to baseline (no exog) but flag it clearly.
+        data_source_info = {
+            "requested": "enhanced",
+            "used": "nino34_only_fallback",
+            "fallback_reason": "exogenous indices (SOI/Niño1+2) unavailable",
+        }
+        results, results_path, predictions_path = run_forecast_on_enso(
+            ctx.enso, outputs_dir=ctx.outputs_dir, data_source_info=data_source_info
+        )
+        ctx.enhanced_results = {**results, "_exog_used": [], "_fallback": True}
+        return None
+
+    data_source_info = {"requested": "enhanced", "used": "enhanced", "fallback_reason": None}
+    results, results_path, predictions_path = run_forecast_on_enso(
+        merged, outputs_dir=ctx.outputs_dir, data_source_info=data_source_info, exog_cols=available
+    )
+    ctx.enhanced_results = {**results, "_exog_used": available, "_fallback": False}
+    return None
+
+
+def _enhanced_latest_for_lead(ctx: ToolContext, lead: int) -> tuple[float, str, float] | None:
+    """Train a single enhanced lead on the fly; return (value, phase, acc).
+
+    Mirrors _forecast_value_for_lead but on the enhanced (exog) table. ACC is
+    computed on the in-sample fit (no held-out test for an ad-hoc lead) so it
+    is optimistic — used only as a coarse confidence bucket, reported honestly.
+    """
+    merged, available = _load_exog_into_ctx(ctx)
+    if not available:
+        return None
+    table, feature_cols = make_enso_supervised_table(merged, leads=(lead,), max_lag=12, exog_cols=available)
+    from sklearn.metrics import mean_absolute_error  # local import keeps module import light
+    from src.models.evaluation import calculate_acc, calculate_regression_metrics
+    from src.models.enso_ml import build_model_suite, fit_models_for_latest_forecast
+
+    models = build_model_suite(random_state=42)
+    forecasts = fit_models_for_latest_forecast(models=models, table=table, feature_cols=feature_cols, lead=lead)
+    primary = "random_forest" if "random_forest" in forecasts else next(iter(forecasts))
+    value = float(forecasts[primary])
+    # In-sample ACC (optimistic) for a coarse confidence bucket.
+    from src.models.baseline import persistence_predict
+    from src.models.evaluation import temporal_train_test_split
+    train, test = temporal_train_test_split(table, test_fraction=0.25)
+    suite = build_model_suite(random_state=42)
+    from src.models.enso_ml import train_and_predict_for_lead
+    preds = train_and_predict_for_lead(models=suite, train_df=train, test_df=test, feature_cols=feature_cols, lead=lead)
+    y_true = test[f"target_lead_{lead}"].to_numpy(dtype=float)
+    acc = calculate_acc(y_true, preds.get(primary, y_true)) if primary in preds else 0.0
+    return value, classify_enso_phase(value), acc
+
+
+def _list_data_sources(ctx: ToolContext) -> str:
+    """List all registered climate-index data sources."""
+    return "\n".join(
+        f"- {s['name']}: {s['description']} (coverage {s['coverage']})"
+        for s in list_sources()
+    ) + "\n\nUse load_index(name) to load one; forecast_enhanced uses soi+nino12 automatically."
+
+
+def _load_index_tool(ctx: ToolContext, name: str) -> str:
+    """Load a single registered index and cache it on the context."""
+    if ctx.loaded_indices is None:
+        ctx.loaded_indices = {}
+    try:
+        df = _registry_load_index(name)
+    except IndexLoadError as exc:
+        return f"Error loading index '{name}': {exc}"
+    ctx.loaded_indices[name] = df
+    val_col = name if name in df.columns else df.columns[-1]
+    return (
+        f"Loaded index '{name}'. rows={len(df)}, "
+        f"date_range={df['date'].min().date()}_to_{df['date'].max().date()}, "
+        f"column={val_col}. Cached for use by forecast_enhanced."
+    )
+
+
+def _forecast_enhanced(
+    ctx: ToolContext, target_year: int, target_month: int, data_source: str = "auto"
+) -> str:
+    """Forecast Niño3.4 for a target month using Ridge/RF + exogenous indices.
+
+    Loads Niño3.4 (cached) plus SOI + Niño1+2, trains the enhanced model, and
+    dispatches by lead. Confidence is data-driven from per-lead ACC: ACC<
+    {ACC_REFUSE} refuses, ACC<{ACC_LOW_CONF} flags low confidence, else normal.
+    If exogenous indices are unreachable, falls back to Niño3.4-only and flags it.
+    """
+    if not (1 <= target_month <= 12):
+        return f"Error: target_month must be 1..12, got {target_month}."
+    err = _ensure_enhanced_results(ctx)
+    if err is not None:
+        return err
+    res = ctx.enhanced_results
+    exog_used = res.get("_exog_used", [])
+    fallback = res.get("_fallback", False)
+
+    last_date = pd.Timestamp(ctx.enso["date"].max())
+    lead = _compute_lead(last_date, target_year, target_month)
+    target = f"{target_year}-{target_month:02d}"
+    last_iso = last_date.strftime("%Y-%m")
+
+    exog_tag = f" exog={exog_used}" if exog_used else " exog=[](fallback to nino34-only)"
+    if fallback:
+        exog_tag = " exog=UNAVAILABLE(fallback nino34-only)"
+
+    if lead <= 0:
+        return f"target={target} (lead={lead}): at or before latest data ({last_iso}); no forecast needed.{exog_tag}"
+
+    if str(lead) in res["latest_forecast"]:
+        fc = res["latest_forecast"][str(lead)]
+        best = res["best_model_by_lead"][str(lead)]
+        acc = res["leads"][str(lead)][best].get("acc", 0.0)
+        conf, tag = _confidence_from_acc(acc)
+        if conf == "refuse":
+            return f"target={target} lead={lead} (enhanced, cached): refusing — ACC={acc:.2f} below reliable range. Recommend a shorter lead or refresh data.{exog_tag}"
+        return (
+            f"target={target} lead={lead} (enhanced, cached): value={fc['value']}, "
+            f"phase={fc['phase']}, model={fc['model']}, acc={acc:.2f}, "
+            f"data_through={last_iso}.{tag}{exog_tag}"
+        )
+
+    # On-the-fly lead (2/4/5/7-11/...): train single lead, use in-sample ACC bucket.
+    try:
+        got = _enhanced_latest_for_lead(ctx, lead)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error training enhanced lead={lead}: {exc.__class__.__name__}: {exc}"
+    if got is None:
+        return f"target={target} lead={lead}: enhanced unavailable (no exog indices loaded).{exog_tag}"
+    value, phase, acc = got
+    conf, tag = _confidence_from_acc(acc)
+    if conf == "refuse":
+        return f"target={target} lead={lead} (enhanced, on-the-fly): refusing — ACC={acc:.2f} below reliable range.{exog_tag}"
+    return (
+        f"target={target} lead={lead} (enhanced, on-the-fly): value={round(value,4)}, "
+        f"phase={phase}, model=random_forest, acc={acc:.2f}, data_through={last_iso}.{tag}{exog_tag}"
+    )
+
+
+def _compare_methods(
+    ctx: ToolContext, target_year: int, target_month: int, data_source: str = "auto"
+) -> str:
+    """Run baseline / enhanced / CNN-LSTM side by side for one target month.
+
+    Each method is invoked independently and its result line collected; a
+    missing method (e.g. CNN-LSTM weights absent) is reported as 'unavailable'
+    rather than aborting the comparison.
+    """
+    if not (1 <= target_month <= 12):
+        return f"Error: target_month must be 1..12, got {target_month}."
+    target = f"{target_year}-{target_month:02d}"
+
+    # Baseline (Ridge/RF): reuse forecast_for_month logic.
+    baseline = _forecast_for_month(ctx, target_year, target_month, data_source)
+
+    # Enhanced.
+    enhanced = _forecast_enhanced(ctx, target_year, target_month, data_source)
+
+    # CNN-LSTM: pick the lead matching the target month's lead for comparability.
+    cnn_line = "cnn_lstm: unavailable (weights not trained or SODA missing)"
+    if CNN_LSTM_WEIGHTS_PATH.exists() and SODA_TRAIN_PATH.exists():
+        if ctx.cnn_forecasts is None:
+            # Trigger a CNN run at lead 1 to populate the cache (the 24-lead
+            # prediction is cached, then we read the matching lead below).
+            _forecast_cnn_lstm(ctx, lead=1)
+        if ctx.cnn_forecasts is not None and "leads" in ctx.cnn_forecasts:
+            # Use the baseline lead for an apples-to-apples comparison.
+            last_date = pd.Timestamp(ctx.enso["date"].max()) if ctx.enso is not None else None
+            if last_date is not None:
+                lead = _compute_lead(last_date, target_year, target_month)
+                if 1 <= lead <= 24 and lead in ctx.cnn_forecasts["leads"]:
+                    e = ctx.cnn_forecasts["leads"][lead]
+                    cnn_line = (
+                        f"cnn_lstm (lead={lead}, SODA末端非实时): value={e['value']}, phase={e['phase']}"
+                    )
+                else:
+                    e = ctx.cnn_forecasts["leads"][12]
+                    cnn_line = (
+                        f"cnn_lstm (lead=12 default, SODA末端非实时): value={e['value']}, phase={e['phase']}"
+                    )
+
+    lines = [f"Method comparison for target={target}:", f"- baseline (Ridge/RF, nino34-only): {baseline}",
+             f"- enhanced (Ridge/RF + SOI/Niño1+2): {enhanced}", f"- {cnn_line}"]
+    return "\n".join(lines)
+
+
+def _report_hindcast_skill(ctx: ToolContext, lead: int | None = None) -> str:
+    """Report CNN-LSTM hindcast skill vs the Persistence null model.
+
+    Answers "is this forecast trustworthy?" the way Ham et al. 2019 (Nature) do:
+    all-season ACC per lead, benchmarked against Persistence (forecast = last
+    observed month). The CNN must beat Persistence — and stay above ACC=0.5 —
+    to claim skill. Reads the precomputed report if present; otherwise runs the
+    hindcast on the fly (needs trained weights).
+
+    Args:
+        lead: if given, return that single lead's CNN-vs-Persistence line plus a
+            reliability verdict; if None, return the full per-lead table.
+    """
+    import json as _json
+
+    data = None
+    if HINDCAST_REPORT_PATH.exists():
+        try:
+            data = _json.loads(HINDCAST_REPORT_PATH.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — corrupt cache, fall through to recompute
+            data = None
+
+    if data is None:
+        if not CNN_LSTM_WEIGHTS_PATH.exists() or not SODA_TRAIN_PATH.exists() or not SODA_LABEL_PATH.exists():
+            return (
+                "Error: hindcast unavailable — need trained weights + SODA data. "
+                "Run: python scripts/train_cnn_lstm.py && python scripts/run_hindcast.py"
+            )
+        try:
+            from src.models.hindcast import run_hindcast
+
+            res = run_hindcast(CNN_LSTM_WEIGHTS_PATH, SODA_TRAIN_PATH, SODA_LABEL_PATH)
+        except Exception as exc:  # noqa: BLE001
+            return f"Error running hindcast: {exc.__class__.__name__}: {exc}"
+        cnn_acc, pers_acc, gap = res.cnn_acc, res.persistence_acc, res.skill_gap
+        leads = res.leads
+        n = res.n_samples
+    else:
+        cnn_acc, pers_acc, gap = data["cnn_acc"], data["persistence_acc"], data["skill_gap"]
+        leads = data["leads"]
+        n = data["n_samples"]
+
+    if lead is not None:
+        if not (1 <= lead <= len(leads)):
+            return f"Error: lead must be 1..{len(leads)}, got {lead}."
+        i = lead - 1
+        c, p, g = cnn_acc[i], pers_acc[i], gap[i]
+        if g > 0 and c >= 0.5:
+            verdict = "reliable — CNN beats Persistence and ACC>=0.5."
+        elif g > 0:
+            verdict = f"skillful vs Persistence (gap=+{g:.2f}) but ACC={c:.2f}<0.5 — indicative only."
+        else:
+            verdict = f"NO skill over Persistence (gap={g:+.2f}) — prefer Persistence or a shorter lead."
+        return (
+            f"lead={lead}: CNN-ACC={c:.3f}, Persistence-ACC={p:.3f}, gap={g:+.3f}. {verdict} "
+            f"(all-season ACC, Ham et al. 2019 metric; n={n} test windows.)"
+        )
+
+    # Full table.
+    lines = [
+        f"Hindcast skill (n={n} test windows). All-season ACC — Ham et al. 2019 metric "
+        f"(their CNN >0.5 to lead≈17). CNN must beat Persistence to claim skill.",
+        f"{'lead':>4} {'CNN-ACC':>8} {'Persist':>8} {'gap':>7}",
+    ]
+    for i, ld in enumerate(leads):
+        lines.append(f"{ld:>4} {cnn_acc[i]:>8.3f} {pers_acc[i]:>8.3f} {gap[i]:>+7.3f}")
+    above_pers = [leads[i] for i in range(len(leads)) if gap[i] > 0]
+    above_05 = [leads[i] for i in range(len(leads)) if cnn_acc[i] >= 0.5]
+    lines.append(f"CNN beats Persistence at leads={above_pers}.")
+    lines.append(f"CNN ACC>=0.5 at leads={above_05}.")
+    lines.append(
+        "Reliability: short leads (1-3) Persistence is stronger (ENSO autocorrelation) — "
+        "use Persistence or Ridge/RF there; CNN's value is lead 4-23 where Persistence fails."
+    )
+    return "\n".join(lines)
+
+
+def _report_realtime_skill(ctx: ToolContext, lead: int | None = None) -> str:
+    """Report CNN-LSTM skill on the REALTIME domain (OISST/GODAS/NCEP).
+
+    This is the only ACC that legitimately judges realtime predictions — the
+    SODA hindcast ACC does NOT transfer across domains. Reads the precomputed
+    realtime hindcast report (``cnn_lstm_realtime_hindcast.json``); if absent,
+    tells the user to run ``scripts/run_realtime_hindcast.py``.
+
+    Pass an optional lead (1..24) for a single-lead cross-domain verdict.
+    """
+    import json as _json
+
+    if not REALTIME_HINDCAST_REPORT_PATH.exists():
+        return (
+            "Error: realtime-domain hindcast not computed yet. "
+            "Run: python scripts/run_realtime_hindcast.py "
+            "(builds a leakage-free climatology + evaluates cross-domain ACC). "
+            "Until then, realtime prediction skill is unquantified — the SODA "
+            "hindcast ACC does NOT apply cross-domain."
+        )
+    try:
+        data = _json.loads(REALTIME_HINDCAST_REPORT_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return f"Error reading realtime hindcast report: {exc}"
+    cnn_acc, pers_acc, gap = data["cnn_acc"], data["persistence_acc"], data["skill_gap"]
+    leads = data["leads"]
+    n = data["n_windows"]
+
+    if lead is not None:
+        if not (1 <= lead <= len(leads)):
+            return f"Error: lead must be 1..{len(leads)}, got {lead}."
+        i = lead - 1
+        c, p, g = cnn_acc[i], pers_acc[i], gap[i]
+        if g > 0 and c >= 0.5:
+            verdict = "cross-domain reliable — beats Persistence and ACC>=0.5."
+        elif g > 0:
+            verdict = f"cross-domain skillful vs Persistence (gap=+{g:.2f}) but ACC={c:.2f}<0.5 — indicative only."
+        else:
+            verdict = f"NO cross-domain skill over Persistence (gap={g:+.2f}) — do not trust this realtime lead."
+        return (
+            f"lead={lead}: CNN-ACC={c:.3f}, Persistence-ACC={p:.3f}, gap={g:+.3f} (REALTIME domain, n={n} windows). {verdict}"
+        )
+
+    lines = [
+        f"Realtime-domain hindcast skill (n={n} windows, eval={data.get('eval_period','?')}). "
+        f"Cross-domain ACC on OISST/GODAS/NCEP — the ONLY metric that judges realtime predictions.",
+        f"{'lead':>4} {'CNN-ACC':>8} {'Persist':>8} {'gap':>7}",
+    ]
+    for i, ld in enumerate(leads):
+        lines.append(f"{ld:>4} {cnn_acc[i]:>8.3f} {pers_acc[i]:>8.3f} {gap[i]:>+7.3f}")
+    above_pers = [leads[i] for i in range(len(leads)) if gap[i] > 0]
+    above_05 = [leads[i] for i in range(len(leads)) if cnn_acc[i] >= 0.5]
+    lines.append(f"CNN beats Persistence at leads={above_pers}.")
+    lines.append(f"CNN ACC>=0.5 at leads={above_05}.")
+    lines.append("Note: this is cross-domain (trained SODA / evaluated realtime). Compare to SODA hindcast for the domain gap.")
+    return "\n".join(lines)
+
+
 def _forecast_for_month(
     ctx: ToolContext, target_year: int, target_month: int, data_source: str = "auto"
 ) -> str:
@@ -596,6 +1127,156 @@ def build_tools(ctx: ToolContext) -> ToolRegistry:
                 "additionalProperties": False,
             },
             fn=lambda lead: _forecast_latest(ctx, lead),
+        ),
+        Tool(
+            name="forecast_cnn_lstm",
+            description=(
+                "Forecast Niño3.4 for a lead time (1..24 months) using the CNN-LSTM "
+                "spatial-field model (trained on SODA sst/t300/ua/va). mode='soda_tail' "
+                "(default) uses SODA's last window — NOT real-time. mode='realtime' fetches "
+                "live OISST+GODAS+NCEP fields, anomalizes against climatologies, and runs the "
+                "same model — real-time but CROSS-DOMAIN (trained SODA / inferred other sources), "
+                "so precision is lower than the SODA hindcast; results are labeled as such and "
+                "hindcast ACC does not apply. Realtime window is cut off at the wind channel's "
+                "latest month (~5-month lag). Use realtime for genuine now-casting, soda_tail for "
+                "method demonstration/hindcast comparison."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "lead": {"type": "integer", "minimum": 1, "maximum": 24},
+                    "mode": {"type": "string", "enum": ["soda_tail", "realtime"], "description": "Default 'soda_tail'."},
+                },
+                "required": ["lead"],
+                "additionalProperties": False,
+            },
+            fn=lambda lead, mode="soda_tail": _forecast_cnn_lstm(ctx, lead, mode),
+        ),
+        Tool(
+            name="list_data_sources",
+            description=(
+                "List all registered climate-index data sources (Niño3.4, SOI, Niño1+2) "
+                "with descriptions and coverage. Use when the user asks what data is "
+                "available, or before loading an index."
+            ),
+            parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+            fn=lambda: _list_data_sources(ctx),
+        ),
+        Tool(
+            name="load_index",
+            description=(
+                "Download and cache one registered climate index by name (e.g. 'soi', "
+                "'nino12', 'nino34') from NOAA/PSL. Returns row count and date range. "
+                "Cached on the session for reuse by forecast_enhanced."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"name": {"type": "string", "enum": ["nino34", "soi", "nino12"]}},
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            fn=lambda name: _load_index_tool(ctx, name),
+        ),
+        Tool(
+            name="forecast_enhanced",
+            description=(
+                "Forecast Niño3.4 for a target month using Ridge/RF augmented with "
+                "exogenous climate indices (SOI + Niño1+2) — the real-time-capable, "
+                "more skillful track. Confidence is data-driven from per-lead ACC: "
+                "below ~0.3 refuses, below ~0.5 flags low confidence. Falls back to "
+                "Niño3.4-only if indices are unreachable. Use for the best real-time "
+                "forecast or when the user wants the enhanced/multivariate model."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_year": {"type": "integer", "description": "Target year, e.g. 2027."},
+                    "target_month": {"type": "integer", "description": "Target month 1..12."},
+                    "data_source": {
+                        "type": "string",
+                        "enum": ["sample", "noaa", "auto"],
+                        "description": "ENSO data source. Default 'auto'.",
+                    },
+                },
+                "required": ["target_year", "target_month"],
+                "additionalProperties": False,
+            },
+            fn=lambda target_year, target_month, data_source="auto": _forecast_enhanced(ctx, target_year, target_month, data_source),
+        ),
+        Tool(
+            name="compare_methods",
+            description=(
+                "Run baseline (Ridge/RF Niño3.4-only), enhanced (Ridge/RF + SOI/Niño1+2), "
+                "and CNN-LSTM side by side for one target month, returning a comparison "
+                "table. Use when the user asks to compare methods/精度 or wants a "
+                "comprehensive forecast. Methods that are unavailable (e.g. CNN-LSTM "
+                "weights not trained) are reported as 'unavailable' without aborting."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_year": {"type": "integer", "description": "Target year, e.g. 2027."},
+                    "target_month": {"type": "integer", "description": "Target month 1..12."},
+                    "data_source": {
+                        "type": "string",
+                        "enum": ["sample", "noaa", "auto"],
+                        "description": "ENSO data source. Default 'auto'.",
+                    },
+                },
+                "required": ["target_year", "target_month"],
+                "additionalProperties": False,
+            },
+            fn=lambda target_year, target_month, data_source="auto": _compare_methods(ctx, target_year, target_month, data_source),
+        ),
+        Tool(
+            name="report_hindcast_skill",
+            description=(
+                "Report CNN-LSTM skill on the SODA TRAINING domain (all-season ACC per lead "
+                "vs Persistence). Use for: 'SODA/训练域/方法上限' questions, or to show the "
+                "model's best-case skill. **Do NOT use this for realtime/live forecast "
+                "reliability** — that is a different domain; use report_realtime_skill instead. "
+                "Pass an optional lead (1..24) for a single-lead verdict."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "lead": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 24,
+                        "description": "Optional: return a single lead's verdict instead of the full table.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            fn=lambda lead=None: _report_hindcast_skill(ctx, lead),
+        ),
+        Tool(
+            name="report_realtime_skill",
+            description=(
+                "Report CNN-LSTM skill on the REALTIME domain (OISST/GODAS/NCEP fields) — "
+                "the ONLY ACC that judges realtime/live predictions. Use for: '实时/realtime/"
+                "live 预测准不准/可不可靠' questions, or after a forecast_cnn_lstm(mode=realtime) "
+                "call when the user cares about reliability. The SODA report_hindcast_skill "
+                "does NOT transfer cross-domain — do not use that for realtime. Pass an "
+                "optional lead (1..24) for a single-lead cross-domain verdict. Requires the "
+                "precomputed realtime hindcast (scripts/run_realtime_hindcast.py)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "lead": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 24,
+                        "description": "Optional: return a single lead's cross-domain verdict.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            fn=lambda lead=None: _report_realtime_skill(ctx, lead),
         ),
         Tool(
             name="classify_phase",
