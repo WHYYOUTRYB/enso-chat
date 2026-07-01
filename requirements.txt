@@ -5,3 +5,9 @@ matplotlib>=3.7
 jinja2>=3.1
 pytest>=7.4
 streamlit>=1.37
+# CNN-LSTM track: training (offline) + CPU inference. torch is heavy (~hundreds
+# of MB) but only the forecast_cnn_lstm tool imports it lazily at call time, so
+# the Streamlit app boots fine without it until that tool is invoked.
+torch>=2.0
+xarray>=2023.4
+netCDF4>=1.6
