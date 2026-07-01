@@ -2,6 +2,9 @@
 
 > 本文档对 PPT 大纲(`docs/enso-chat-ppt-outline.md`)中的关键技术点做深度补充,
 > 供讲解时展开或答辩时备查。每个技术点配:原理 → 代码实现 → 设计权衡 → 边界与陷阱。
+>
+> 项目当前规模:~4500 行 Python | 82 测试 | 21 工具 | 双轨预测(baseline/enhanced/CNN-LSTM)+ 三层评估(SODA/Realtime/Persistence)。
+> 技术点 1-10 是 agent 工程与基线轨(session 1),11-16 是科学方法升级与实时管道(session 2-5)。
 
 ---
 
@@ -236,6 +239,8 @@ def _forecast_for_month(ctx, target_year, target_month, data_source="auto"):
 - **为何 ≥12 直接拒绝而非给数字**:ENSO 预测 12 个月后相关系数通常 <0.3,给数字会误导。系统宁可说"超出可靠范围,建议刷新数据或改近月",这是科学诚实。
 - **为何 7-11 仍预测但标低可信**:边界灰区,用户可能需要参考。给数字但明确标注"indicative only",决策权交用户。
 - **临时 lead 的模型选择**:`_forecast_value_for_lead` 对临时 lead 没有 test split 评估,直接选 random_forest(在 sample 数据上通常最优)。这是已知简化,代码注释和 `recommend_data_range` 都如实说明。
+
+> **演进**:技术点 11 介绍了增强轨的**数据驱动分档**——用 per-lead ACC 替代这里的硬编码 7/12 阈值,仅在 enhanced 路径局部应用(不破坏基线测试)。
 
 ---
 
@@ -540,3 +545,255 @@ for fig in _new_figures(ctx):
 
 - **关页面即丢**:session_state 是内存态,刷新或关闭浏览器后清空。这是设计选择(原型够用),非 bug。
 - **临时目录清理**:`atexit.register(shutil.rmtree, path)` 确保进程退出时清理,不污染磁盘。
+
+---
+
+## 技术点 11:数据驱动的 lead 可信度分档(增强轨)
+
+### 原理
+
+技术点 4 的硬编码分档(7/12 月阈值)是经验值,答辩时被问"为什么是 7 不是 8"难答。增强轨改成**读 per-lead ACC 数据驱动分档**:某个 lead 在测试集上 ACC 跌破阈值才降档,有数据支撑。
+
+### 实现(`tools.py:_confidence_from_acc` + `config.py`)
+
+```python
+ACC_LOW_CONF = 0.5   # 低于此值标低可信
+ACC_REFUSE = 0.3     # 低于此值拒绝预测
+
+def _confidence_from_acc(acc):
+    if acc < ACC_REFUSE:
+        return "refuse", f" [拒绝: ACC={acc:.2f}<{ACC_REFUSE}]"
+    if acc < ACC_LOW_CONF:
+        return "low_confidence", f" [低可信: ACC={acc:.2f}<{ACC_LOW_CONF}]"
+    return "normal", f" [ACC={acc:.2f}]"
+```
+
+### 设计权衡
+
+| 方面 | 选择 | 理由 |
+|---|---|---|
+| 应用范围 | **仅 enhanced 路径** | 不改 `_forecast_for_month` 硬编码,避免破坏基线 38 项测试和 CNN-LSTM 轨 |
+| 阈值可调 | 写进 `config.py` | 0.5/0.3 是经验值,答辩可讨论;不像硬编码藏在函数里 |
+| ACC 来源 | 测试集 in-sample | 临时 lead 无独立 test split,用 train/test split 的 ACC 作粗档,诚实标注"optimistic" |
+
+### 边界
+
+- **ACC 是历史技能不是未来保证**:某个 lead 历史 ACC=0.6,不代表这次预测一定准——它只说"这个 lead 上模型平均比随机强"。agent 转述时用 ACC 解释可信度,但仍标"参考性"。
+- **阈值 0.5/0.3 的依据**:0.5 是 ENSO 预报界"有技能"的常见门槛(Ham et al. 用);0.3 是"几乎无技能"的经验下限。可调。
+- **不全局替换硬编码**:基线 `_forecast_for_month` 仍用 7/12 硬档——因为基线没接外生变量,ACC 曲线不同,且改它会回归。两套分档并存是刻意的工程取舍。
+
+---
+
+## 技术点 12:CNN-LSTM 空间场轨与离线训练/在线推理分离
+
+### 原理
+
+单变量自回归(技术点 9)撞 ENSO 物理天花板(春季预测障碍)。突破要靠空间场前兆信号(sst/t300/ua/va)。CNN-LSTM 是这条轨的模型,对标 Ham et al. 2019 (Nature)。关键工程约束:**训练在 GPU/离线,推理在 CPU/在线,两者彻底分离**——Streamlit 进程永远不训练神经网络。
+
+### 实现(`src/models/cnn_lstm.py` + `scripts/train_cnn_lstm.py`)
+
+```
+离线训练(scripts/train_cnn_lstm.py,不进 Streamlit):
+  SODA sst/t300/ua/va (100年×36月×24纬×72经)
+    → 连续月序列滑窗(12月输入 → 24 lead 目标)
+    → 留缓冲三划分(训0-70/验70-82/缓冲82-85/测85-99)
+    → 只用训练集统计量标准化
+    → CNN(3conv)+LSTM(2层)+FC(24) 训练,早停
+    → 权重存 weights/cnn_lstm_soda.pth (49M,含 x_mean/x_std)
+
+在线推理(predict_cnn_lstm,torch 懒加载):
+  输入窗口 (12,24,72,4) → 标准化(用 checkpoint 的 SODA 统计量)
+    → model.forward() → 24 lead {value, phase}
+```
+
+### 设计权衡
+
+| 方面 | 选择 | 理由 |
+|---|---|---|
+| 训练/推理分离 | 离线脚本 + 内置权重 | Streamlit 无 GPU、要秒级响应;训练耗时数十分,不该在线做 |
+| torch 依赖 | 懒加载(工具内 import) | `import tools` 不触发 torch;仅 `forecast_cnn_lstm` 调用时才加载 |
+| 划分留缓冲 | 82-85 年不用 | 测试窗口起点≥85,与训练尾隔开,防时序渗透虚高 ACC |
+| 标准化 | 只用训练集统计量,存 checkpoint | 推理时复用训练分布;若用全集统计量=测试集泄露 |
+| 数据 | SODA-only(无 CMIP) | 仓库无 CMIP 数据;走 notebook 默认路径,小样本靠早停+dropout 缓解 |
+
+### 边界与陷阱
+
+- **小样本过拟合**:SODA 100 年单一再分析,CNN-LSTM 易过拟合。Dropout(0.7)+weight_decay+早停缓解,但这是已知局限,答辩"局限性"页写明。
+- **SODA 匿名年份**:SODA 的 year/month 是竞赛匿名索引(1-100 block),非真实日历。这导致无法做 SODA-vs-realtime 同月对比(见技术点 14),但不影响训练(训练只用相对时序)。
+- **t300 vs 热含量**:论文 Ham et al. 用上层 300m 热含量(HC),本轨用 t300(300m 层温度),信息量弱一档——这是 SODA 变量所限,已知简化。
+- **权重体积**:49M 内置仓库偏大,可接受;若云部署要省体积可后续换 onnxruntime。
+
+---
+
+## 技术点 13:数据源注册表与外生指数实时拉取
+
+### 原理
+
+"让 agent 自主找数据"若做成自由 web 搜索,可靠性差且不可复现。本项目的取舍:**预置受控数据源注册表**,agent 在审定过的源里列/选/加载,有自主体感又不失控。
+
+### 实现(`src/data/source_registry.py`)
+
+```python
+@dataclass(frozen=True)
+class DataSource:
+    name: str; description: str; url: str; value_col: str; coverage: str
+
+REGISTRY = {
+    "nino34": DataSource(..., "https://psl.noaa.gov/.../nino34.long.anom.data", ...),
+    "soi":    DataSource(..., ".../soi.long.data", ...),    # 大气端前兆
+    "nino12": DataSource(..., ".../nino12.long.data", ...), # 东太平洋海洋端前兆
+}
+# 复用 noaa_enso.parse_nino34_table 的解析逻辑,泛化为 parse_year_month_table
+# 三个源同格式(年+12值,-99.99缺测),解析器一份共用
+```
+
+工具层:`list_data_sources`(列源) / `load_index(name)`(拉取+缓存) / `forecast_enhanced`(自动用 soi+nino12)。
+
+### 设计权衡
+
+| 方面 | 选择 | 理由 |
+|---|---|---|
+| 自由搜索 vs 注册表 | 注册表(受控) | ENSO 预测对数据质量极敏感,自由抓取=不可控;注册表保证格式/单位/覆盖已知 |
+| WWV 替代 | 用 Niño1+2 | WWV 无可靠静态源(CPC 不可达、PMEL 文件移除);Niño1+2 是东太平洋上涌区,ENSO 发展前兆,与 Niño3.4 区域不同有独立信息 |
+| 解析器复用 | 泛化 `parse_year_month_table` | 三源同格式,一份解析器;加新源只需注册一条 |
+| 缓存 | raw/processed 双文件 | 复用 noaa_enso 模式;首次下载,后续走缓存 |
+
+### 边界
+
+- **Niño3.4 URL 修复**:原 `gcos_wgsp/Timeseries/...` 路径已 404(NOAA/PSL 迁移),修成 `data/timeseries/month/data/...`。这是隐藏 bug——靠 sample 回退没暴露,但"真要能用"必须修。
+- **SOI 末尾缺测**:SOI 序列末尾几个月常 -99.99,merge on date 自动剔除。
+- **不做 web search 发现**:自由发现(搜候选源、自动试探接入)是后续可选项,本阶段不做——可靠性优先于"全自动"噱头。
+
+---
+
+## 技术点 14:实时空间场管道与跨域异常化对齐
+
+### 原理
+
+CNN-LSTM 训练在 SODA(存 anomalies,mean≈0),推理却喂 OISST/GODAS/NCEP(存绝对值)。直接喂=致命域偏移。**异常化对齐**是核心:每个实时源减自身 30 年月气候态转异常,匹配 SODA 的异常分布,再用 SODA 训练统计量标准化。
+
+### 实现(`src/data/realtime_fetch.py` + `climatology.py`)
+
+```
+四通道实时拉取(全免注册 OPeNDAP):
+  sst  : NCEI OISST 日值(月中1天近似) → 月均 → 异常化 → 重采样
+  t300 : PSL GODAS pottmp(303m层,K→°C) → 异常化 → 重采样
+  ua/va: PSL NCEP/NCAR R1(850hPa) → 异常化 → 重采样
+  ↓
+窗口统一截止到风场最新月(~5月滞后是瓶颈),诚实标注不伪造填充
+  ↓
+predict_cnn_lstm_realtime: 用 SODA 的 x_mean/x_std 标准化 → CNN 前向
+  ↓
+结果标注 "cross-domain, 精度低于 SODA hindcast"
+```
+
+### 设计权衡
+
+| 方面 | 选择 | 理由 |
+|---|---|---|
+| 跨域处理 | 异常化对齐(不重训) | 重训需建新训练管道,工程翻倍;异常化缓解域偏移够用,诚实标注剩余损失 |
+| 风场滞后 | 接受 5 月,窗口截止风场最新月 | 换 ERA5 需注册;5月滞后可接受,不拿旧风场填充假装实时 |
+| SST 月均 | 月中1天近似 | 真月均要下30个日文件(336请求,慢且脆);1天近似对 ENSO 月值精度够 |
+| 大文件 | OPeNDAP 切片 | NCEP 整文件437MB下载断连;OPeNDAP 按时间/层切片几秒拉完 |
+| 3D interp | 逐时间片 | OPeNDAP 对3D整段interp返回0;逐2D切片resample正确 |
+
+### 边界与陷阱(全是实测踩过的)
+
+- **OPeNDAP 3D interp 返回 0**:`da.interp(lat,lon)` 对含 time 的 3D 整段请求,服务器返回全 0。必须先 `isel(time=i)` 取 2D 片再 interp。
+- **GODAS `interp(level=300)` 远程返回 0**:OPeNDAP 不支持跨层 interp,改 `sel(level=303, nearest)`,偏差 3m 可忽略。
+- **netCDF4 中文路径**:读写 `D:\作品\...` 都失败(PermissionError/FileNotFoundError)。读用临时 ASCII 拷贝;气候态改 npz 存储。
+- **OISST sst 4 维**:有 zlev 层,需 `isel(zlev=0)` squeeze。
+- **陆地 NaN**:重采样到海洋外陆地点产生 NaN,`nan_to_num` 填 0,否则 CNN 输出 NaN。
+- **跨域精度不可用 SODA ACC 评估**:这是诚实底线——SODA 域 ACC 0.77 不能说 realtime 也 0.77。见技术点 15。
+
+---
+
+## 技术点 15:三层评估协议(SODA / Realtime / Persistence)
+
+### 原理
+
+"预测准不准"不能靠感觉,要用 hindcast(历史回测)算每个 lead 的 ACC。但训练域(SODA)和推理域(realtime)不同,ACC 不能跨域套用。所以建**三层评估**:SODA hindcast(方法上限)、Realtime hindcast(真实跨域效果)、Persistence 基准(技能锚,两域都有)。
+
+### 实现(`src/models/hindcast.py` + `realtime_hindcast.py`)
+
+```
+SODA hindcast:
+  SODA 测试集(85-99年) → CNN 前向 → 对比 SODA 真实 nino → per-lead ACC
+  + Persistence 基线(forecast = 最后观测月)
+  → 可靠窗口 lead4-23, SPB 低谷可见, 对标 Ham et al.
+
+Realtime hindcast:
+  OISST/GODAS/NCEP 历史段(2020-2021) → 异常化(用 2005-2015 气候态,不重叠防泄露)
+  → CNN 前向 → 对比 NOAA 真实 Niño3.4 → per-lead ACC + Persistence
+  → lead1-2 跨域可靠(0.86/0.75), 中长 lead 待扩样本
+```
+
+### 设计权衡
+
+| 方面 | 选择 | 理由 |
+|---|---|---|
+| 指标 | all-season ACC | Ham et al. 2019 口径;ENSO 预报标准技能分 |
+| 基准 | Persistence | 最简单可行基线(未来=现在);CNN 必须跑赢它才有存在价值 |
+| 两域独立评估 | SODA + Realtime 各算 | 跨域 ACC 不可迁移,必须分别评 |
+| 泄漏防护 | 气候态期 ≠ 评估期 | realtime 用 2005-2015 算气候态、2020-2021 评估,不重叠 |
+| 工具化 | `report_hindcast_skill` / `report_realtime_skill` | agent 能自主调工具回答"准不准",这是项目特色 |
+
+### 边界
+
+- **SODA 匿名年份限制**:SODA year 是竞赛索引,无法映射真实日历。导致 SODA-vs-realtime 同月对比不可行(曾尝试做"跨域差异诊断"失败,已删脚本)。但不影响各自 hindcast——SODA 用自己时序,realtime 用真实日历。
+- **Realtime n=7 样本小**:评估窗 2020-01~2021-06 只 7 个窗口,中长 lead ACC 不稳(出现 Persistence 0.9+ 异常值)。短 lead 结论可信,中长待扩到 ~30 窗口(2018-2021)。
+- **ACC 是相关性不是精度**:ACC 高只说"相位对",不代表数值准。RMSE 补幅度信息,但选模用 RMSE、报技能用 ACC(ENSO 相位比幅度重要)。
+- **agent 路由**:两个 hindcast 工具描述需明确区分,避免 realtime 问句误调 SODA 工具。已知优化点。
+
+---
+
+## 技术点 16:对话驱动的科学决策(agent 自主编排)
+
+### 原理
+
+本项目最终价值不是"预测更准",而是"agent 能自主调度多方法 + 自评可靠性"。一次用户提问,agent 不被动应答,而是自主编排:加载合适数据 → 选方法 → 预测 → 调评估工具查技能 → 诚实给建议。这是"对话驱动科学决策"的完整闭环。
+
+### 实现(真实 DeepSeek 对话轨迹)
+
+用户:"明年3月的Niño3.4会是多少?请用增强方法预测,并和CNN-LSTM对比"
+
+```
+agent 自主 7 步编排(无人工干预):
+  step1 load_enso_data(auto→真实NOAA, 1876行, 到2026-04)
+  step2 load_index(soi)        ← 在线拉外生指数
+  step3 load_index(nino12)     ← 在线拉外生指数
+  step4 recommend_data_range(2027-03 → lead11, 低可信桶)
+  step5 forecast_enhanced(2027-03) → value=0.03, ACC=0.38 → 自动标低可信
+  step6 forecast_cnn_lstm(realtime, lead11) → 跨域标注
+  step7 forecast_latest(lead1) → 主动补短期 La Niña
+  → 生成三方法对比表 + "建议6月内再关注" 的可靠性建议
+```
+
+### 设计权衡
+
+| 方面 | 选择 | 理由 |
+|---|---|---|
+| 自主编排 vs 脚本回放 | 自主(LLM 决策) | OfflineClient 已删;对话式必须 LLM 理解意图选工具,这是 agent 价值所在 |
+| 多方法并存 | 三槽不互相覆盖 | `results`/`enhanced_results`/`cnn_forecasts` 分槽,同会话对比不丢数据 |
+| 可靠性自评 | 工具化(agent 调 hindcast) | 不在 prompt 里编"我相信这个预测",而是调工具拿 ACC 数字,有据可查 |
+| 诚实建议 | agent 用 ACC 解释 + 给替代方案 | "lead11 ACC=0.38 低可信,建议6月内再关注"——不是敷衍,是数据驱动 |
+
+### 边界
+
+- **agent 路由不完美**:有时 realtime 问句会误调 SODA hindcast 工具(两工具描述相似)。这是 LLM 路由优化项,非代码 bug——工具本身工作正常。
+- **编排深度依赖 prompt**:`SYSTEM_PROMPT` 引导"如实说明不确定性,不编造数值"。换更弱模型可能编排退化。
+- **不是全自动科研**:agent 在审定工具集内决策,不发明新方法。这是刻意的——可靠性优先于"全自动"噱头。评委会问"agent 能自己加方法吗",诚实答"不能,加方法是人定义工具,agent 在工具集内自主调度"。
+
+---
+
+## 附:技术点与 session 对应
+
+| 技术点 | session | 主题 |
+|---|---|---|
+| 1-10 | session 1 | agent 工程 + 基线轨(loop/工具/状态/防泄露/客户端/CSV/评估/Streamlit) |
+| 11 | session 4 | 数据驱动 lead 分档(增强轨) |
+| 12 | session 2 | CNN-LSTM 空间场轨 + 离线训练/在线推理 |
+| 13 | session 4 | 数据源注册表 + 外生指数 |
+| 14 | session 5 | 实时空间场管道 + 跨域异常化 |
+| 15 | session 3+5 | 三层评估协议(SODA/Realtime/Persistence) |
+| 16 | session 5 | 对话驱动科学决策(主线收束) |

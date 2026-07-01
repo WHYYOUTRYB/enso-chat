@@ -1,227 +1,251 @@
-# ENSO 对话式 Agent:实现与原理
+# ENSO 对话式 Agent:对话驱动的多方法科学预测
 
-> PPT 大纲 + 每页讲稿。重点放在"如何实现"和"背后原理"。
-> 
-> 项目:enso-chat/ | 代码 2296 行 Python | 26 个测试 | 14 个工具
+> PPT 大纲 + 每页讲稿。主线:**用对话 agent 串起多方法可信预测**——agent 工程与科学方法并重。
+>
+> 项目:enso-chat/ | ~4500 行 Python | 82 个测试 | 21 个工具 | 双轨预测 + 三层评估
+
+## 叙事主线(讲之前先想清楚)
+
+这个项目不是"套个对话壳的预测脚本",也不是"孤立的科学模型"。核心叙事是:
+**对话 agent 让多个预测方法(基线 / 增强 / CNN-LSTM)并存且可对比,并把"可靠性判断"本身交给 LLM 自主调用工具完成。**
+
+评委如果只记一件事,应该是这条:agent 不只是预测,它还能**自己回答"这个预测可不可信"**(调 hindcast 工具看 ACC、对比 Persistence 基准)。
+
+---
 
 ## 第 1 页:标题页
 
 **标题**:ENSO 对话式预报 Agent
-**副标题**:从"一次性流水线"到"全对话式"的架构演进
+**副标题**:对话驱动的多方法预测与可靠性自评估
 **脚注**:○○○ 课程项目 | 2026-07
 
-**讲稿**:大家好。今天讲一个对话式 ENSO 预报 agent 的实现和原理。ENSO 是厄尔尼诺-南方涛动,热带太平洋最重要的海气耦合模态。这个 agent 能和你自然对话——你说"明年 3 月怎么样",它自动算提前量、加载数据、预测、画图、甚至可以上传自己的数据。我从零开始讲清楚每一层怎么实现。
+**讲稿**:大家好。今天讲一个 ENSO 预报 agent。它的特点不是"能对话",而是"通过对话让多个科学方法协同,并且能自评可靠性"。你说"明年 3 月怎么样,准不准",agent 会自动选方法、预测、然后调工具查这个 lead 的历史技能,告诉你能不能信。我从架构讲到科学方法,再到这套"自评可靠性"是怎么实现的。
 
-## 第 2 页:系统能做什么
+## 第 2 页:系统能做什么(能力一览,先建立印象)
 
-**标题**:系统能力一览
+**标题**:不只是预测——会自评可靠性的对话 agent
 
-- 对话式预测:自然语言提需求月,agent 自动算 lead 并预测
-- 可信度分档:1-6 月正常,7-11 月低可信,≥12 月拒绝预测
-- 三种建模方法:Persistence 基线 / Ridge 回归 / Random Forest
-- 6 类工具:数据加载 / 预测诊断 / 画图 / 降水分析 / 潮汐演示 / CSV 上传
-- 上传自有数据:上传 ENSO CSV,agent 自动建模
-- 对话历史管理:太长自动摘要压缩
+- 对话式预测:自然语言提需求月,agent 自动算 lead、选方法、预测
+- **多方法并存**:基线(Ridge/RF) / 增强(+外生指数) / CNN-LSTM(空间场深度学习)
+- **可靠性自评估**:agent 主动调 hindcast 工具,用 ACC + Persistence 基准回答"准不准"
+- 可信度数据驱动:按 per-lead ACC 分档,<0.3 拒绝、<0.5 低可信
+- 数据源注册表:在线拉取 NOAA Niño3.4 / SOI / Niño1+2,agent 自主列源/选源/加载
+- 实时空间场:CNN-LSTM 在线拉 OISST+GODAS+NCEP 做真·实时推理
+- 对话历史管理:超长自动摘要压缩;CSV 上传自带数据
 
-**讲稿**:先给一个整体印象。用户打开 Streamlit 聊天页,可以问任何 ENSO 相关问题。agent 不只是查表——它现场训练机器学习模型、做预测、画图、还会根据提前量判断结果可不可信。如果你传了自己的 Niño3.4 数据,它会用你的数据替换示例数据。
+**讲稿**:先建立印象。这个 agent 有两层能力:预测层有三类方法从简单到复杂并存;评估层让它能回答"预测可不可信"——这是大多数预测系统缺失的一环。数据上既有一维指数在线拉取,也有 CNN-LSTM 需要的空间场实时管道。下面先讲架构,再讲科学方法,最后讲可靠性自评估这条主线。
 
-## 第 3 页:整体架构
+## 第 3 页:整体架构(四层 + 双轨 + 三评估)
 
-**标题**:三层架构:引擎 → 工具 → 对话 loop
+**标题**:四层架构:引擎 → 工具 → 对话 loop,双轨预测 + 三层评估
 
 ```
-┌────────────────────────────────┐
-│  Streamlit chat UI (app.py)   │  ← 用户交互层
-├────────────────────────────────┤
-│  run_turn (turn-by-turn loop) │  ← 对话调度层
-│  + summarize_old_messages     │     (新写,非一次性 loop)
-├────────────────────────────────┤
-│  14 个工具 (tools.py)         │  ← 工具层
-│  ToolContext (共享状态)       │     每个工具返回字符串
-├────────────────────────────────┤
-│  科学引擎                      │  ← 模型层
-│  data/features/models/分析/画图 │     纯 Python,无 LLM 依赖
-└────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  Streamlit chat UI                           │  交互层
+├──────────────────────────────────────────────┤
+│  run_turn (turn-by-turn loop)                │  对话调度
+│  + summarize_old_messages (历史压缩)         │  (状态外化,每轮交还控制权)
+├──────────────────────────────────────────────┤
+│  21 个工具 (tools.py)  ToolContext 多槽并存  │  工具层
+│  results / enhanced_results / cnn_forecasts  │  (重对象在 ctx,文本在 messages)
+├──────────────────────────────────────────────┤
+│  双轨预测                三层评估             │  科学层
+│  ├ baseline (Ridge/RF)   ├ SODA hindcast     │
+│  ├ enhanced (+SOI/N12)   ├ Realtime hindcast │
+│  └ CNN-LSTM (空间场)     └ Persistence 基准  │
+└──────────────────────────────────────────────┘
 ```
 
-**讲稿**:这张图是核心。整系统分四层。最底下是科学引擎——数据处理、特征工程、机器学习模型、可视化,全部纯 Python,pandas + scikit-learn,和 LLM 无关。工具层把引擎的每个功能包装成"工具"——每个工具有名字、描述、JSON Schema 参数、一个可调用函数,返回紧凑字符串而非 DataFrame,让 LLM 能高效消费。对话调度层是新写的 `run_turn`——它不是一次性跑完,而是每轮"模型回复→调工具→喂回结果→直到模型不调工具"就返回控制权,等用户下一条消息。最上层是 Streamlit chat,纯粘合代码。
+**讲稿**:整系统四层。底下科学层是关键:预测分双轨——一维指数轨(基线+增强,实时主力)和空间场轨(CNN-LSTM,方法上限);评估分三层——SODA 域 hindcast(训练域,方法上限)、Realtime 域 hindcast(推理域,真实跨域效果)、Persistence 基准(两域都有,技能锚)。工具层把双轨+评估都包成工具,ToolContext 用多槽让三方法结果并存不互相覆盖。对话层是 turn-by-turn,每轮交还控制权。这张图是全局地图,后面每页展开一块。
 
-## 第 4 页:工具层设计——让 LLM 能"动手"
+## 第 4 页:对话 loop——turn-by-turn 状态外化(agent 核心)
 
-**标题**:14 个工具 = 14 个 LLM 可调用的"手"
-
-| 工具 | 做什么 | 原理要点 |
-|---|---|---|
-| `load_enso_data` | 加载 sample/NOAA 数据并训练模型 | 幂等:同源二次调用走缓存 |
-| `load_user_enso` | 加载用户上传的 ENSO CSV | 调 `run_forecast_on_enso` 核心 |
-| `forecast_for_month` | 预测指定目标月 Niño3.4 | lead 分档:≤6 正常,7-11 低可信,≥12 拒 |
-| `classify_phase` | Niño3.4 值→El Niño/La Niña/Neutral | ±0.5℃ 阈值 |
-| `diagnose_local_data` | 诊断本地数据覆盖与新鲜度 | 纯 FS 扫描,零 API |
-| `recommend_data_range` | 评估目标月是否在可靠范围内 | 返 bucket + allow_run |
-| 4 个画图工具 | 时间序列/预测对比/RMSE/阶段图 | matplotlib → PNG |
-| `analyze_precipitation` | 降水异常按 ENSO 阶段统计 | boxplot |
-| `run_tide_prediction` | 潮汐演示预测 | Ridge + 调和特征 |
-
-**讲稿**:每个工具就是 LLM 的一只"手"。关键设计就一个原则:**工具返回紧凑字符串,重对象(DataFrame、模型结果)存在 `ToolContext` 里跨轮复用**。比如 `load_enso_data` 返回"rows=540,date=1980→2024,best_model=linear_ridge",100 字;实际的 540 行 DataFrame 存在 `ctx.enso`,LLM 不需要看到。`forecast_for_month` 算 lead 分档,12 个月以上直接拒——不是技术做不到,是可预报性物理上限,必须诚实。
-
-## 第 5 页:对话 loop 原理(turn-by-turn)
-
-**标题**:`run_turn`——不是一次跑完,是一轮一轮交还控制权
+**标题**:`run_turn`——不自己持有状态,借用调用方的对话历史
 
 ```python
 def run_turn(messages, tools, client, on_step=None):
     while step < max_steps:
         assistant = client.chat(messages, tools.schemas())
-        messages.append(assistant)
+        messages.append(assistant)          # ← 原地追加外部列表
         if not assistant.tool_calls:
-            return TurnResult(messages, assistant.content)  # ← 控制权还给用户!
+            return TurnResult(messages, assistant.content)  # ← 控制权还给用户
         for call in assistant.tool_calls:
             result = tools.execute(call.name, call.args)
-            on_step(step, name, args, result)  # ← 传给 UI 渲染折叠块
+            on_step(...)                    # ← 回调给 UI 渲染折叠块
             messages.append({"role":"tool", ...})
 ```
 
-**讲稿**:这才是对话式 agent 的心脏。旧版本 `run_agent` 是封闭 while 循环:调模型→执行工具→继续→直到模型不调工具,全程不可中断。`run_turn` 的区别**:它不自己建 messages,而是接收外部传入的对话历史**。每轮用户发消息后追加进 history,调一轮直到模型自然停止,然后返回。控制权还给用户——用户随时发下一条消息,追加进 history,再调一次 `run_turn`。三个保护:指数退避重试(429/5xx)、循环检测(连续相同调用 3 次就停)、max_steps 硬上限。
+**三重保护**:指数退避重试(429/5xx/网络) · 循环检测(连续相同签名 3 次早停) · max_steps 硬上限(15)。
 
-## 第 6 页:状态管理——对话记忆怎么跨轮保持
+**讲稿**:对话式 agent 的心脏。和一次性 `run_agent` 的根本区别:它不自己建 messages,而是接收外部传入的对话历史,原地追加。这样 Streamlit 的 `session_state.messages` 就是天然持久层,用户下一条消息追加进来再调一次 `run_turn`,上下文连续。三个保护保证鲁棒:瞬时错误退避重试、模型卡死循环早停、单轮工具调用上限防失控。`on_step` 回调把每次工具调用传给 UI 渲染折叠块——loop 不耦合 Streamlit,纯函数可测。
 
-**标题**:记忆分两块:对话历史 + 重对象
+## 第 5 页:工具层——"重对象在 ctx,文本在 messages"
 
-```
-session_state
-  ├─ messages: [system, ...user1, assistant1, tool_results, user2, ...]
-  │   (纯文本,每轮追加)
-  │
-  └─ ctx: ToolContext(enso=DataFrame, results=dict, figure_paths=[Path])
-      (重对象,工具层读写,LLM 不直接感知)
-```
+**标题**:21 个工具,共享 ToolContext 多槽状态
 
-**讲稿**:对话记忆分两块。**对话历史**(messages 列表)存文本——system 提示词 + 每轮 user/assistant/tool 消息。这是 LLM 的上下文,也是跨轮"记住刚才聊了什么"的载体。**重对象**(enso DataFrame、模型结果 dict、图文件路径)存在 `ToolContext` 上——这是共享工作记忆,工具层读写,LLM 看不见原始 DataFrame,只通过工具结果字符串了解摘要。`ToolContext` 里的 enso 和 results 第一次被 `load_enso_data` 加载后,后续 `forecast_for_month` 直接读缓存,不用重训。对话历史太长时,`summarize_old_messages` 把旧消息压成摘要,保留最近 6 条。
+| 类别 | 工具 | 关键设计 |
+|---|---|---|
+| 数据 | `load_enso_data` `load_user_enso` `load_index` `list_data_sources` `diagnose_local_data` | 幂等缓存;数据源注册表 |
+| 预测 | `forecast_for_month` `forecast_latest` `forecast_enhanced` `forecast_cnn_lstm` | 双轨并存,mode 区分 soda_tail/realtime |
+| 评估 | `report_hindcast_skill` `report_realtime_skill` `recommend_data_range` `compare_methods` | **可靠性自评估工具集** |
+| 分析画图 | `classify_phase` `analyze_precipitation` `run_tide_prediction` + 4 画图 | matplotlib→PNG 内联展示 |
 
-## 第 7 页:摘要压缩原理
+**核心原则**:工具返回**紧凑字符串摘要**(路径+关键数字),重对象(DataFrame/results/权重)存在 `ToolContext` 多槽——`results`(基线)/`enhanced_results`(增强)/`cnn_forecasts`(CNN)并存,不互相覆盖。
 
-**标题**:对话太长怎么办——自动摘要压缩
+**讲稿**:工具层两个要点。第一,每个工具返回字符串而非 DataFrame——540 行序列化进 messages 会爆上下文,所以重对象存 ctx,LLM 只看摘要。第二,多方法结果分槽并存:基线、增强、CNN 各占一个槽,agent 同会话调三方法做对比时不会互相覆盖。表里高亮的是评估类工具——这是项目特色,agent 不只预测,还能调 `report_hindcast_skill` 查历史技能、`compare_methods` 并排对比,实现"自评可靠性"。
 
-```
-messages = [system, ...u1...a10]    (token 超阈值)
-    ↓
-旧消息 [u1..a7] → DeepSeek("摘要要点,不编造数值")
-    ↓
-新 messages = [原 system, {system: 摘要}, a8, u9, a9, u10, a10]
-                 ↑ 保留           ↑ 摘要注入    ↑ 最近 3 轮不动
-```
+## 第 6 页:科学方法(1)——基线轨与防数据泄露
 
-**关键设计**:失败回退——DeepSeek 摘要调用失败→返回原 messages,不阻塞对话。
-
-**讲稿**:这个设计很务实。token 估算是粗粒度的——数字符,不精确,只是触发信号。压缩时把旧消息(除 system 提示词和最近 6 条)发给 DeepSeek,让它"摘要成要点,保留关键预测结果,不要编造数值"。摘要注入成一条 system 消息,和原 system 提示词并存。最近 6 条不动,保证当前对话连贯。最关键:如果摘要调用失败(网络/配额),直接返回原 messages,**宁可不压缩也不崩对话**。
-
-## 第 8 页:LLM 客户端——为什么只留 DeepSeek
-
-**标题**:`LLMClient` 协议 → 单一 `DeepSeekClient`
-
-```python
-class LLMClient(Protocol):
-    def chat(messages, tools, tool_choice="auto") -> AssistantMessage: ...
-
-class DeepSeekClient:           # OpenAI 兼容,urllib 实现,零额外依赖
-    def chat(messages, tools):  # POST /chat/completions
-        ...                      # 指数退避重试:429/5xx/网络
-
-# OfflineClient:已删除
-# 对话式必须 LLM,离线脚本无法对话
-```
-
-**讲稿**:旧 agent 有一个 `OfflineClient`——它不调 LLM,而是按固定 8 步脚本回放(load→plot→precip→tide→report)。对话式 agent 不能离线:每一步都需要 LLM 理解用户意图并选择工具。所以删掉了 OfflineClient,只留 `DeepSeekClient`。它用标准库 `urllib`,不依赖 openai SDK。带了指数退避重试:瞬时错误(429/5xx/网络)自动重试最多 3 次,认证错误(401)立即抛。无 API key 时聊天框直接 disabled,不白跑。
-
-## 第 9 页:用户上传 CSV 的实现
-
-**标题**:`load_user_enso`——让用户自带数据
+**标题**:基线轨:Persistence + Ridge + Random Forest,严格无泄露
 
 ```
-[Streamlit sidebar file_uploader]
-    ↓ 上传 my_enso.csv (date+nino34)
-[存到 session temp dir]
-    ↓ 路径写进 session_state["user_csv_path"]
-[用户:"我用上传的数据分析"]
-    ↓ LLM 调 load_user_enso(path=path)
-[load_enso_csv() 校验列名+行数] → 特征工程 → 模型训练 → 1/3/6 lead 预测
-    ↓ ctx.enso ← 用户数据
-    ↓ ctx.results ← 新模型结果
-[后续 forecast_for_month 自动用用户数据]
+Niño3.4 月度序列
+  ↓ 特征:lag_0..12 + 滚动均值3/6 + month sin/cos   (只用当前和历史)
+  ↓ 目标:shift(-lead) 未来值                        (负号=未来)
+  ↓ 时间顺序切分 train/test (75/25,不随机打乱)
+  ↓ 三模型:Persistence(基线) / Ridge(α=1.0) / RF(120树,depth8)
+  ↓ RMSE 选最优 + ACC 进结果(供数据驱动分档)
 ```
 
-**讲稿**:上传功能的实现链路:侧栏 file_uploader 存 CSV 到临时目录,把路径写进 session_state。用户在对话里说"加载我的数据",LLM 理解后调 `load_user_enso(path)`。工具内部用 `load_enso_csv` 校验——必须有 date 和 nino34 列,至少 30 行;校验不过返 Error 字符串,不崩。通过后调 `run_forecast_on_enso`(和 `load_enso_data` 共享的核心),训练 Ridge+Random Forest,结果写进 ctx。之后所有预测自动用用户数据。`run_forecast_on_enso` 是从 `run_enso_forecast` 提取出来的:136 行"已有 enso→预测"逻辑抽成独立函数,两种加载方式共享。
+**防泄露三道防线**:特征只用 lag≥0(历史) · 目标用 shift(-lead)(未来) · 时间序切分(非随机)。
 
-## 第 10 页:预测原理——从 Niño3.4 值到 ENSO 阶段
+**讲稿**:基线轨是实时预测的底线。特征工程只允许当前和历史信息进入——lag_0 是当前值,lag_12 是一年前,绝不用 shift(-k) 当特征(那是未来)。目标用负号 shift,表示要预测的未来值。切分按时间顺序,绝不用 sklearn 随机 split——那会让测试集时间点混进训练集之前,形成时间泄露。三模型里 Persistence 是基线中的基线(假设未来=现在),用来判断 ML 是否真有效——如果 ML 不如 Persistence,说明特征或模型有问题。每个 lead 的 RMSE 和 ACC 都进结果,ACC 供后面的数据驱动分档用。
 
-**标题**:预测管道:特征→模型→lead→阶段
+## 第 7 页:科学方法(2)——增强轨:外生气候指数
+
+**标题**:增强轨:加 SOI + Niño1+2 突破单变量瓶颈
+
+**问题**:基线只用 Niño3.4 自身滞后,撞春季预测障碍(SPB)——能跨春的前兆信号在**大气端(SOI)和东太平洋海洋端(Niño1+2)**。
+
+**方案**:
+- 数据源注册表(`source_registry.py`):NOAA/PSL 三源在线拉取,免注册 ASCII
+- `enso_features` 加 `exog_cols`:SOI/Niño1+2 各加 13 个 lag 特征
+- `forecast_enhanced`:Niño3.4 + 外生指数 → Ridge/RF
+- **lead 可信度数据驱动**:读 per-lead ACC,<0.3 拒绝、<0.5 低可信(替代硬编码 7/12)
+
+**讲稿**:基线轨的天花板在物理——ENSO 跨春预测靠的不是 Niño3.4 自己,而是次表层和大气前兆。增强轨加 SOI(南方涛动指数,大气端)和 Niño1+2(东太平洋上涌区,海洋端)两个外生指数。这两个都是 NOAA/PSL 在线可拉的一维月值,套现有解析器,实时可用。关键改进:lead 可信度不再硬编码"7-11 月低可信",而是读这个 lead 在测试集上的 ACC——ACC 跌破 0.5 才标低可信、跌破 0.3 才拒绝。这让分档有数据支撑,答辩能讲清"为什么这个 lead 不可信"。
+
+## 第 8 页:科学方法(3)——CNN-LSTM 空间场轨
+
+**标题**:CNN-LSTM:sst/t300/ua/va 空间场,对标 Ham et al. 2019 (Nature)
 
 ```
-ENSO 月度序列 (nino34)
-    ↓ 特征工程
-  [lag_0..lag_12, roll_mean_3, roll_mean_6, month_sin, month_cos]
-    ↓ 时间顺序切分(train/test,25% test,不放随机)
-    ↓ 三类模型
-  Persistence(未来=现在) | Ridge(α=1.0) | RandomForest(120 trees, max_depth=8)
-    ↓ 1/3/6 月提前量
-  y_{t+h} = model(features_t)
-    ↓ RMSE 选最佳模型
-    ↓ Niño3.4 值 → classify_phase(±0.5℃)
-    ↓ 3 种状态
-  El Niño (≥+0.5) / Neutral (-0.5~+0.5) / La Niña (≤-0.5)
+输入:12 月 × (24纬×72经) × 4 通道  (sst/t300/ua/va)
+  ↓ CNN 提空间特征(每时间步)
+  ↓ LSTM 建时序(2层)
+  ↓ FC 输出 24 lead Niño3.4
 ```
 
-**讲稿**:预测管道分五步。特征工程:用滞后项(lag_0 到 lag_12)、3 月和 6 月滚动均值、月份周期编码(sin/cos),**只使用当前和历史信息,无未来泄露**。数据按时间顺序切分,不是随机打乱——时间序列必须这样。三类模型:Persistence 是基线(假设未来等于现在,判断 ML 是否有效);Ridge 回归可解释;Random Forest 120 棵树、深度 8。每个 lead 单独评估——1 月、3 月、6 月三个 target。选 RMSE 最低的模型做最终预测。最后用 ±0.5℃ 阈值把连续值变成 El Niño/Neutral/La Niña 三分类。
+- **训练**:SODA 再分析,留缓冲三划分(训0-70/验70-82/缓冲82-85/测85-99),防时序渗透
+- **标准化**:只用训练集统计量;NaN→0;BatchNorm+Dropout(0.7) 抗小样本过拟合
+- **离线训练 / 在线推理分离**:权重 49M 内置,torch 懒加载,Streamlit 无依赖启动
+- **复用参考 notebook 架构**(CNN-LSTM),SODA-only 训练(无 CMIP 数据)
 
-## 第 11 页:特征工程——防止数据泄露
+**讲稿**:CNN-LSTM 是方法上限。参考 Ham et al. 2019 Nature 论文和提供的参考 notebook,用四个空间场通道:CNN 提取每个时间步的空间特征,LSTM 建时序,一次输出 24 个 lead。训练在 SODA 再分析上,关键是划分留了缓冲区——测试集窗口起点在 85 年后,和训练尾完全隔开,防止时序渗透虚高 ACC。工程上离线训练、在线只做 CPU 前向推理,权重内置仓库,Streamlit 启动不需要 torch。这是和基线/增强轨并存的第三种方法,不是替代。
 
-**标题**:只用历史信息,不用未来信息
+## 第 9 页:可靠性评估(1)——Hindcast 协议与 SODA 域技能
 
-```python
-def make_enso_supervised_table(df, leads=(1,3,6), max_lag=12):
-    for lag in range(max_lag+1):
-        data[f"nino34_lag_{lag}"] = data["nino34"].shift(lag)  # ← lag=0 是当前
-    # 目标:未来 h 个月的 Niño3.4
-    for lead in leads:
-        data[f"target_lead_{lead}"] = data["nino34"].shift(-lead)  # ← 负号表示"未来"
-    # 时间顺序切分,不是随机
-    train, test = temporal_train_test_split(table, test_fraction=0.25)
+**标题**:怎么判断预测准不准——hindcast + Persistence 基准(对标 Nature 论文)
+
+**核心**:预测可靠性不是"感觉",是**该 lead 在历史测试集上的 ACC**(异常相关系数),对标 Ham et al. 2019 口径。
+
+| lead | CNN-ACC | Persistence | gap | 判断 |
+|---|---|---|---|---|
+| 1-3 | 0.77/0.67/0.59 | 0.91/0.77/0.61 | **负** | Persistence 略胜(ENSO 短期自相关) |
+| 4-13 | 0.53→0.48 | 0.45→-0.15 | **正且扩大** | CNN 有真技能,可靠窗口起点 |
+| 10 (SPB谷) | 0.31 | **-0.10** | +0.40 | Persistence 已失效,CNN 仍正技能 |
+| 14-24 | ~0.52 | -0.16→0.58 | 正→负 | CNN 稳在 0.5+,对标论文 lead17>0.5 |
+
+**结论**:可靠窗口 lead 4-23;CNN 的价值在 Persistence 失效的中长 lead;长 lead 量级对齐 Nature 论文。
+
+**讲稿**:这页回答"准不准"。可靠性不能靠感觉,要用 hindcast——在历史测试集上算每个 lead 的 ACC,这是 Ham et al. Nature 论文用的口径。关键要对比 Persistence 基准:短期(lead1-3)Persistence 反而比 CNN 强,因为 ENSO 短期自相关太强,"明天=今天"几乎不可战胜,这正常;但 lead4 起 CNN 开始碾压,到 lead10 春季预测障碍低谷时 Persistence 已经负相关、CNN 仍是正技能——CNN 的存在价值就在这里。长 lead CNN 稳在 0.5+,和论文"lead17 仍>0.5"同量级。这张表是答辩最有力的证据:可靠窗口、SPB 可见、对标论文,全有了。
+
+## 第 10 页:可靠性评估(2)——Realtime 域与跨域诚实
+
+**标题**:训练域≠推理域——Realtime hindcast 才是真效果
+
+**问题**:CNN 在 SODA 训练,推理却喂 OISST+GODAS+NCEP。**SODA 域 ACC 不能直接套到 realtime**。
+
+**方案**:用 realtime 源历史段做独立 hindcast,对比真实 Niño3.4,算跨域 ACC。
+- 泄漏无关气候态:气候态期(2005-2015)与评估期(2020-2021)不重叠
+- 异常化对齐:realtime 源减自身气候态转异常,匹配 SODA 的异常分布
+- 同口径:all-season ACC + Persistence 基准
+
+**结果**(n=7 窗口,短 lead 可信):
+- lead1=0.86, lead2=0.75 — **跨域损失不严重,realtime 短期可靠**
+- 中长 lead 因 n=7 样本小,标注"待扩样本"
+
+**诚实底线**:realtime 结果永远标注"cross-domain,精度低于 SODA hindcast",不混淆两域 ACC。
+
+**讲稿**:这页是科学诚实的核心。SODA 域 ACC 0.77 不能直接说"realtime 也 0.77"——因为训练和推理用了不同数据源,存在跨域偏移。所以单独建 realtime 域 hindcast:用 OISST/GODAS/NCEP 历史段跑 CNN,对比真实 Niño3.4。结果短 lead 跨域效果不错(0.86/0.75),说明异常化对齐有效;中长 lead 因为样本只有 7 个窗口,结论不稳,诚实标注"待扩样本"。最关键的是工具返回永远带"cross-domain"标注,agent 不会拿 SODA 的 ACC 冒充 realtime——这是大多数预测系统不敢做的诚实。
+
+## 第 11 页:实时数据管道——从"拿不到最新数据"到真·实时
+
+**标题**:CNN-LSTM 实时化:OISST+GODAS+NCEP,免注册 OPeNDAP
+
+**难点**:CNN 推理需 12 月 × 4 通道空间场,SODA 末端是历史固定点,不是"现在"。
+
+**方案**:
+| 通道 | 源 | 滞后 | 工程坑(已解决) |
+|---|---|---|---|
+| sst | NCEI OISST 日值(月中近似) | ~1-2周 | 中文路径读 nc→临时ASCII拷贝;zlev 维 squeeze |
+| t300 | PSL GODAS pottmp(303m层) | ~1月 | OPeNDAP interp跨层返回0→sel nearest |
+| ua/va | PSL NCEP/NCAR R1 850hPa | ~5月 | 整文件437MB断连→OPeNDAP切片;3D interp返回0→逐片 |
+
+**窗口截止**:风场5月滞后是瓶颈,窗口统一截止到风场最新月,诚实标注不伪造填充。
+
+**讲稿**:这页解决"拿不到最新数据"。CNN-LSTM 原来只能用 SODA 末端,没法做真·实时。实时管道在线拉四个源,全是免注册 OPeNDAP。过程修了一堆环境坑:NCEP 整文件 437MB 下载断连改 OPeNDAP 切片;OPeNDAP 对 3D 数据 interp 返回 0 改逐时间片;netCDF4 读不了中文路径用临时 ASCII 拷贝。风场滞后 5 个月是瓶颈,所以窗口截止到风场最新月,sst/t300 更新的部分被截掉——诚实标注,不拿旧风场填充假装实时。这页的工程含量很高,但答辩重点是"真要能用"这个目标怎么落地。
+
+## 第 12 页:对话驱动的科学决策(主线收束)
+
+**标题**:agent 自主编排多方法 + 自评可靠性
+
+**真实对话示例**(用户:"明年3月怎样?对比三方法,准不准"):
+
+```
+agent 自主 7 步编排:
+  1. load_enso_data(auto→真实NOAA)     4. recommend_data_range(2027-03→lead11低可信)
+  2. load_index(soi)  3. load_index(nino12)   (在线拉外生指数)
+  5. forecast_enhanced(2027-03)  → ACC=0.38 自动标低可信
+  6. forecast_cnn_lstm(realtime, lead11)  → 跨域标注
+  7. forecast_latest(lead1)  → 主动补短期 La Niña
+  → 生成三方法对比表 + 可靠性解读
 ```
 
-**讲稿**:特征工程最关键的一条:只用当前和历史信息,不允许未来信息泄露。`lag_0` 就是当前值,`lag_1` 是上个月,往后推到 `lag_12`。target 用负号 shift——`shift(-3)` 就是"3 个月后的值"。时间序列切分不用 sklearn 的随机 split,而是按时间点切——前面 75% 训练,后面 25% 测试。这样测试集在训练集的时间之后,符合实际预测场景。
+**讲稿**:这页是整条主线的收束。agent 不是被动的"问什么答什么",它收到"对比三方法+准不准"后,自主编排了 7 步:加载数据、拉外生指数、算 lead、跑增强预测(并用 ACC 解释低可信)、跑 CNN 实时预测、主动补一个短期预测、最后生成对比表。最关键的是第 5 步——agent 拿到 ACC=0.38 后,**自发**告诉用户"这个 lead 可信度低,建议6月内再关注"。这就是"对话驱动科学决策"的完整闭环:多方法 + 自评可靠性 + 诚实建议,全部 LLM 自主调度。评委如果问"agent 比 scripts 强在哪",这页就是答案。
 
-## 第 12 页:关键代码回顾
+## 第 13 页:关键代码与规模
 
 **标题**:核心模块一览
 
-| 文件 | 行数 | 职责 | 关键函数 |
-|---|---|---|---|
-| `src/agent/tools.py` | ~580 | 14 个工具 + ToolContext + build_tools | `_forecast_for_month`, `recommend_data_range_dict` |
-| `src/agent/run_turn.py` | ~120 | turn-by-turn loop | `run_turn`, `_chat_with_retry` |
-| `src/agent/summarizer.py` | ~80 | 对话历史摘要压缩 | `summarize_old_messages`, `estimate_tokens` |
-| `src/agent/client.py` | ~200 | DeepSeek API client | `DeepSeekClient.chat`, 指数退避 |
-| `src/pipeline/run_enso_forecast.py` | ~240 | ENSO 预测核心 | `run_forecast_on_enso`, `run_enso_forecast` |
-| `src/web/app.py` | ~190 | Streamlit chat 粘合 | `main`, `_render_tool_step` |
-| `src/features/enso_features.py` | 50 | 特征工程 | `make_enso_supervised_table` |
-| `src/models/enso_ml.py` | 65 | Ridge + Random Forest | `build_model_suite`, `fit_models_for_latest_forecast` |
-| **总计** | **~2300** | 26 测试,14 工具 | |
+| 区 | 文件 | 职责 |
+|---|---|---|
+| agent | `run_turn.py` `client.py` `summarizer.py` `tools.py` | 对话 loop + 21 工具 + DeepSeek client |
+| 科学引擎 | `features/` `models/` `analysis/` `visualization/` `pipeline/` | Ridge/RF + CNN-LSTM + 特征 + 画图 |
+| 数据 | `noaa_enso.py` `source_registry.py` `realtime_fetch.py` `climatology.py` | NOAA拉取 + 注册表 + 实时管道 + 气候态 |
+| 评估 | `hindcast.py` `realtime_hindcast.py` `evaluation.py` | SODA/Realtime hindcast + ACC |
+| web | `app.py` `chat_helpers.py` | Streamlit chat 粘合 |
+| 离线脚本 | `train_cnn_lstm.py` `build_climatology.py` `run_hindcast.py` `run_realtime_hindcast.py` | 训练/气候态/评估(不进 Streamlit) |
 
-**讲稿**:最后过一遍代码规模。总共 2300 行 Python,分四大区:agent(工具+loop+client+摘要)~980 行,科学引擎(data/features/models/analysis/viz)~950 行,pipeline~240 行,web(chat UI)~200 行。26 个测试覆盖工具层、loop、摘要、chat_helpers、预测核心。这不是大项目,但每层职责单一、接口清晰——对话 loop 不懂工具细节,工具不懂 LLM 协议,科学引擎根本不知道 LLM 存在。
+**总计**:~4500 行 Python,82 测试,21 工具,4 个离线脚本,49M CNN 权重内置。
 
-## 第 13 页:总结与讨论
+**讲稿**:代码规模。四大区:agent(~1100行)、科学引擎(~1300行)、数据与评估(~900行,含实时管道)、web(~250行)。82 个测试覆盖工具层、loop、摘要、hindcast、实时管道,零网络依赖隔离测试。四个离线脚本负责训练和评估,不进 Streamlit 进程——这是"离线训练/在线推理分离"的体现。CNN 权重 49M 内置仓库,推理 CPU 即可。
+
+## 第 14 页:总结与讨论
 
 **标题**:总结
 
-1. **工具层是关键抽象**——把 ML 模型包装成 LLM 可调用的工具,是"让 AI 做科研"的通路
-2. **turn-by-turn 比一次性 loop 更适合对话**——状态外化,用户主导,可插话
-3. **设计要诚实地表达不确定性**——lead≥12 不预测,7-11 标低可信度
-4. **"重对象在 ctx,文本在 messages"**——这个分离让 LLM 高效消费信息
+1. **对话 agent 串起多方法科学预测**——基线/增强/CNN-LSTM 并存且可对比,不是套壳
+2. **可靠性自评估是核心特色**——agent 调 hindcast 工具用 ACC+Persistence 回答"准不准"
+3. **科学诚实贯穿全系统**——lead 按 ACC 数据驱动分档;跨域不混淆 ACC;SPB 可见
+4. **工程务实**——OPeNDAP 切片、离线训练/在线推理、多槽状态并存、零网络测试隔离
 
 **讨论点**:
-- 如何评估 agent 的"规划"能力?prompt 清单 vs 自主分解
-- 对话式 vs 一次性:不同场景选不同形态
-- 更多数据源(NOAA/GPCP/ERA5)接入的扩展性
+- agent 的"规划"能力边界:prompt 引导 vs 自主分解(本项目 7 步自主编排)
+- realtime hindcast 样本扩展(2018-2021,~30窗口)可让中长 lead 结论更稳
+- 标准气候态(1991-2020)替换迷你版,提升科学严谨度
+- agent 路由优化:两个 hindcast 工具描述区分,避免误调
 
-**讲稿**:四点总结。工具层把领域知识封装成 LLM 可调用的接口,这是"让 AI 做科研"的通用模式。turn-by-turn 让用户主导对话,而不是 agent 闷头跑完。lead 可信度分档是诚实的设计——科学上 ENOS 可预报性随 lead 衰减,系统必须如实表达不确定性。最后,"重对象在 ctx,文本在 messages"这个分离,是 agent 能高效运行的核心工程决策。
+**讲稿**:四点总结。第一,这个 agent 真正的价值是让多方法协同并对比,不是给预测套个对话壳。第二,可靠性自评估是特色——大多数预测系统只给数字不给"能不能信",这个 agent 能。第三,科学诚实贯穿始终:数据驱动分档、跨域不混淆、SPB 可见。第四,工程上务实解决真问题:OPeNDAP 切片绕开大文件、离线在线分离、多槽状态、测试隔离。讨论点留几个诚实的不完美:realtime 样本待扩、气候态待标准化、agent 路由待优化——这些是"做满"的项,不影响当前答辩完整性。
 
-**页数**:约 13 页,每页 1-2 分钟,总计 15-25 分钟。
+**页数**:约 14 页,每页 1.5-2 分钟,总计 20-25 分钟。
