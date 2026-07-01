@@ -28,7 +28,7 @@ from src.models.enso_ml import (
     fit_models_for_latest_forecast,
     train_and_predict_for_lead,
 )
-from src.models.evaluation import calculate_regression_metrics, temporal_train_test_split
+from src.models.evaluation import calculate_acc, calculate_regression_metrics, temporal_train_test_split
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,13 @@ class EnsoForecastOutput:
 
 def _round_metrics(metrics: dict[str, float]) -> dict[str, float]:
     return {key: round(value, 4) for key, value in metrics.items()}
+
+
+def _metrics_with_acc(y_true, y_pred) -> dict[str, float]:
+    """RMSE/MAE/corr plus ACC — ACC is the ENSO skill standard (anomaly corr)."""
+    base = calculate_regression_metrics(y_true, y_pred)
+    base["acc"] = calculate_acc(y_true, y_pred)
+    return base
 
 
 def _ensure_precip_and_tide_samples(sample_dir: Path) -> None:
@@ -118,6 +125,7 @@ def run_forecast_on_enso(
     *,
     outputs_dir: Path,
     data_source_info: dict,
+    exog_cols: list[str] | None = None,
 ) -> tuple[dict, Path, Path]:
     """Run the ENSO modeling pipeline on an already-loaded ENSO DataFrame.
 
@@ -126,15 +134,21 @@ def run_forecast_on_enso(
     RandomForest for 1/3/6-month leads, evaluates, and writes the results
     JSON + predictions CSV to ``outputs_dir``.
 
-    Returns ``(results, results_path, predictions_path)``.
+    When ``exog_cols`` is given (e.g. ``["soi", "nino12"]``), those columns
+    must already be merged into ``enso`` and are added as lag features — the
+    "enhanced" track. ``None`` keeps the original Niño3.4-only behavior.
+
+    Returns ``(results, results_path, predictions_path)``. Each model's metrics
+    include ``acc`` (anomaly correlation) for data-driven lead-confidence.
     """
     outputs_dir.mkdir(parents=True, exist_ok=True)
-    table, feature_cols = make_enso_supervised_table(enso, leads=DEFAULT_LEADS, max_lag=12)
+    table, feature_cols = make_enso_supervised_table(enso, leads=DEFAULT_LEADS, max_lag=12, exog_cols=exog_cols)
     train, test = temporal_train_test_split(table, test_fraction=0.25)
 
     results: dict = {
         "target": "Niño3.4 index",
         "data_source": data_source_info,
+        "exog_cols": list(exog_cols) if exog_cols else [],
         "leads": {},
         "best_model_by_lead": {},
         "latest_forecast": {},
@@ -148,7 +162,7 @@ def run_forecast_on_enso(
         lead_metrics: dict[str, dict[str, float]] = {}
         persistence_pred = persistence_predict(test)
         lead_metrics["persistence"] = _round_metrics(
-            calculate_regression_metrics(y_true, persistence_pred)
+            _metrics_with_acc(y_true, persistence_pred)
         )
 
         ml_predictions = train_and_predict_for_lead(
@@ -159,7 +173,7 @@ def run_forecast_on_enso(
             lead=lead,
         )
         for model_name, y_pred in ml_predictions.items():
-            lead_metrics[model_name] = _round_metrics(calculate_regression_metrics(y_true, y_pred))
+            lead_metrics[model_name] = _round_metrics(_metrics_with_acc(y_true, y_pred))
             for date_value, observed, predicted in zip(test["date"], y_true, y_pred):
                 prediction_rows.append(
                     {

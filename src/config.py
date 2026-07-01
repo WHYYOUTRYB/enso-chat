@@ -18,8 +18,29 @@ NOAA_ENSO_PROCESSED_PATH = PROCESSED_DATA_DIR / "noaa_nino34.csv"
 NOAA_NINO34_URL_ENV = "NOAA_NINO34_URL"
 DEFAULT_NOAA_NINO34_URL = os.environ.get(
     NOAA_NINO34_URL_ENV,
-    "https://psl.noaa.gov/gcos_wgsp/Timeseries/Data/nino34.long.anom.data",
+    "https://psl.noaa.gov/data/timeseries/month/data/nino34.long.anom.data",
 )
+
+# --- Exogenous climate indices (PSL monthly timeseries, same ASCII format) ---
+# SOI (Southern Oscillation Index, atmospheric ENSO precursor) and Niño1+2
+# (eastern-Pacific SST, upwelling region precursor). WWV has no reliable static
+# source (CPC unreachable, PMEL file removed), so Niño1+2 stands in for the
+# ocean-subsurface precursor role. Override each via its own env var if mirrored.
+SOI_URL_ENV = "SOI_URL"
+DEFAULT_SOI_URL = os.environ.get(
+    SOI_URL_ENV, "https://psl.noaa.gov/data/timeseries/month/data/soi.long.data"
+)
+NINO12_URL_ENV = "NINO12_URL"
+DEFAULT_NINO12_URL = os.environ.get(
+    NINO12_URL_ENV, "https://psl.noaa.gov/data/timeseries/month/data/nino12.long.data"
+)
+
+# --- Data-driven lead confidence (enhanced track) ---
+# Replace the hard-coded 7/12-month thresholds with per-lead ACC buckets: an
+# Anomaly Correlation Coefficient below ACC_LOW_CONF flags a lead as indicative
+# only; below ACC_REFUSE the model refuses to predict. Empirical values, tunable.
+ACC_LOW_CONF = 0.5
+ACC_REFUSE = 0.3
 
 DEFAULT_LEADS = (1, 3, 6)
 DEFAULT_RANDOM_SEED = 42
