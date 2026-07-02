@@ -28,6 +28,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src.agent.client import DeepSeekClient, DeepSeekError
 from src.agent.run_turn import run_turn
@@ -41,6 +42,37 @@ from src.web.chat_helpers import (
     parse_tool_step,
     should_summarize,
 )
+
+# Project presentation deck. Local copy drives the download button; the GitHub
+# raw URL drives the Office Online in-browser preview (works on Streamlit Cloud
+# too, since the file is publicly served there).
+_PPTX_PATH = _PROJECT_ROOT / "reports" / "outputs" / "ENSO_Chat_Academic_Presentation.pptx"
+_PPTX_GITHUB_RAW = (
+    "https://github.com/WHYYOUTRYB/enso-chat/raw/main/"
+    "reports/outputs/ENSO_Chat_Academic_Presentation.pptx"
+)
+
+
+def _presentation_deck_ui() -> None:
+    """Sidebar block: download the project presentation + toggle in-browser preview."""
+    st.subheader("项目汇报 PPT")
+    if _PPTX_PATH.exists():
+        st.download_button(
+            "📥 下载汇报 PPT（15 页）",
+            data=_PPTX_PATH.read_bytes(),
+            file_name=_PPTX_PATH.name,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            help="下载后在 PowerPoint / WPS / Keynote 中打开",
+        )
+    else:
+        st.caption("（本地未找到 PPT，跳过下载）")
+    st.session_state.setdefault("show_ppt_preview", False)
+    st.checkbox(
+        "📑 在线预览 PPT",
+        value=st.session_state["show_ppt_preview"],
+        key="show_ppt_preview",
+        help="用 Microsoft Office Online 在浏览器内翻看（需联网）",
+    )
 
 
 def _session_base_dir() -> Path:
@@ -159,6 +191,24 @@ def main() -> None:
     st.set_page_config(page_title="ENSO 对话 Agent", page_icon="🌊", layout="wide")
     st.title("🌊 ENSO 对话式 Agent")
 
+    # In-browser presentation preview (toggled from the sidebar). Uses Microsoft
+    # Office Online with the GitHub-hosted file as src — no LibreOffice / extra
+    # dependency required. Falls back to a download link if the viewer is blocked.
+    if st.session_state.get("show_ppt_preview"):
+        with st.container(border=True):
+            st.subheader("📑 项目汇报 PPT（在线预览）")
+            from urllib.parse import quote
+
+            office_url = (
+                "https://view.officeapps.live.com/op/view.aspx?src="
+                + quote(_PPTX_GITHUB_RAW, safe="")
+            )
+            components.iframe(office_url, height=620, scrolling=True)
+            st.caption(
+                "若预览未加载（网络/浏览器拦截），可用侧栏「下载汇报 PPT」。"
+                f"直链：{_PPTX_GITHUB_RAW}"
+            )
+
     with st.sidebar:
         st.header("配置")
         model_choice = st.radio("LLM 后端", ["DeepSeek", "GLM"], index=0,
@@ -175,6 +225,7 @@ def main() -> None:
         if st.button("🗑️ 清空对话"):
             st.session_state["messages"] = init_messages(SYSTEM_PROMPT)
             st.rerun()
+        _presentation_deck_ui()
         st.divider()
         st.caption("河海大学 海洋技术专业 · 韩烁小组")
         st.caption("成员：韩烁 张佳赢 栗一润 李孟航 刘荣双 韦邦贤")
