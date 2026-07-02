@@ -81,6 +81,8 @@ def _resolve_enso_data(
     data_source: str,
     refresh_noaa: bool,
     base_dir: Path | None,
+    *,
+    timings: dict | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     allowed = {"auto", "noaa", "sample"}
     if data_source not in allowed:
@@ -99,6 +101,7 @@ def _resolve_enso_data(
                 raw_path=noaa_raw_path,
                 processed_path=noaa_processed_path,
                 refresh=refresh_noaa,
+                timings=timings,
             )
             # Precipitation and tide always use sample data (design §6); make
             # sure those CSVs exist so downstream modules work in NOAA mode.
@@ -126,6 +129,7 @@ def run_forecast_on_enso(
     outputs_dir: Path,
     data_source_info: dict,
     exog_cols: list[str] | None = None,
+    timings: dict | None = None,
 ) -> tuple[dict, Path, Path]:
     """Run the ENSO modeling pipeline on an already-loaded ENSO DataFrame.
 
@@ -142,8 +146,12 @@ def run_forecast_on_enso(
     include ``acc`` (anomaly correlation) for data-driven lead-confidence.
     """
     outputs_dir.mkdir(parents=True, exist_ok=True)
+    import time as _time
+    _t_feat = _time.perf_counter()
     table, feature_cols = make_enso_supervised_table(enso, leads=DEFAULT_LEADS, max_lag=12, exog_cols=exog_cols)
     train, test = temporal_train_test_split(table, test_fraction=0.25)
+    if timings is not None:
+        timings["features"] = round(_time.perf_counter() - _t_feat, 3)
 
     results: dict = {
         "target": "Niño3.4 index",
@@ -154,7 +162,7 @@ def run_forecast_on_enso(
         "latest_forecast": {},
     }
     prediction_rows: list[dict] = []
-
+    _t_train = _time.perf_counter()
     for lead in DEFAULT_LEADS:
         target_col = f"target_lead_{lead}"
         y_true = test[target_col].to_numpy(dtype=float)
@@ -216,9 +224,13 @@ def run_forecast_on_enso(
 
     results_path = outputs_dir / "enso_results.json"
     predictions_path = outputs_dir / "enso_predictions.csv"
-
+    if timings is not None:
+        timings["train"] = round(_time.perf_counter() - _t_train, 3)
+    _t_write = _time.perf_counter()
     results_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     pd.DataFrame(prediction_rows).to_csv(predictions_path, index=False)
+    if timings is not None:
+        timings["write"] = round(_time.perf_counter() - _t_write, 3)
 
     return results, results_path, predictions_path
 
@@ -227,6 +239,8 @@ def run_enso_forecast(
     base_dir: Path | None = None,
     data_source: str = "auto",
     refresh_noaa: bool = False,
+    *,
+    timings: dict | None = None,
 ) -> EnsoForecastOutput:
     if base_dir is None:
         sample_dir = SAMPLE_DATA_DIR
@@ -240,9 +254,10 @@ def run_enso_forecast(
         data_source=data_source,
         refresh_noaa=refresh_noaa,
         base_dir=base_dir,
+        timings=timings,
     )
     results, results_path, predictions_path = run_forecast_on_enso(
-        enso, outputs_dir=outputs_dir, data_source_info=data_source_info
+        enso, outputs_dir=outputs_dir, data_source_info=data_source_info, timings=timings
     )
 
     return EnsoForecastOutput(

@@ -74,3 +74,11 @@ AGENT_RETRY_MAX_DELAY = 8.0
 AGENT_LOOP_LIMIT = 3
 # run_turn: max tool calls within a single turn before giving control back.
 AGENT_MAX_STURNS = 15
+
+# --- Data freshness (预测时自查) ---
+# ENSO is monthly; NOAA/PSL publishes the prior month's value mid-late the
+# following month. So "data_through" lagging more than this many months behind
+# "now" means the series is stale and a refresh is warranted before trusting a
+# forecast (the cutoff month is the forecast baseline). 2 = "if the latest
+# value is older than ~2 months, the data is stale". Tunable.
+ENSO_STALE_MONTHS = 2

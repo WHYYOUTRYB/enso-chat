@@ -547,6 +547,55 @@ def test_compare_methods_has_provenance_header(tmp_path, monkeypatch):
     assert "样本" in out
 
 
+# --- data freshness self-check on forecast prefix ---
+
+
+def test_forecast_prefix_flags_stale_data(tmp_path, monkeypatch):
+    """When the loaded ENSO series is stale, the forecast prefix says so."""
+    ctx = ToolContext(base_dir=tmp_path)
+    tools = build_tools(ctx)
+    tools.execute("load_enso_data", {"data_source": "sample"})
+    # The stale-check only runs for real-source tracks (noaa/auto/user), so mark
+    # the loaded source as 'noaa' to exercise that branch.
+    ctx.results["data_source"]["used"] = "noaa"
+    import src.agent.data_freshness as dfm
+
+    monkeypatch.setattr(dfm, "is_stale", lambda dt, **kw: True)
+    monkeypatch.setattr(dfm, "data_age_months", lambda dt: 9)
+    out = tools.execute("forecast_for_month", {"target_year": 2027, "target_month": 3})
+    head = out.split("\n")[0]
+    assert "数据偏旧" in head
+    assert "9" in head  # the age months
+
+
+def test_forecast_prefix_silent_when_fresh(tmp_path, monkeypatch):
+    """Fresh data -> no stale warning in the prefix."""
+    ctx = ToolContext(base_dir=tmp_path)
+    tools = build_tools(ctx)
+    tools.execute("load_enso_data", {"data_source": "sample"})
+    ctx.results["data_source"]["used"] = "noaa"
+    import src.agent.data_freshness as dfm
+
+    monkeypatch.setattr(dfm, "is_stale", lambda dt, **kw: False)
+    out = tools.execute("forecast_for_month", {"target_year": 2027, "target_month": 3})
+    assert "数据偏旧" not in out
+
+
+# --- stage timings on the forecast pipeline ---
+
+
+def test_run_enso_forecast_records_timings(tmp_path):
+    from src.pipeline.run_enso_forecast import run_enso_forecast
+
+    timings: dict = {}
+    out = run_enso_forecast(base_dir=tmp_path, data_source="sample", timings=timings)
+    # On the sample path there's no NOAA download, so 'download' may be absent;
+    # but features + train + write should always be present and positive.
+    assert "features" in timings and timings["features"] >= 0
+    assert "train" in timings and timings["train"] > 0
+    assert "write" in timings
+
+
 # --- hindcast skill reporting ---
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -72,7 +73,16 @@ def load_or_download_noaa_enso(
     url: str = DEFAULT_NOAA_NINO34_URL,
     refresh: bool = False,
     timeout: float = 20.0,
+    *,
+    timings: dict | None = None,
 ) -> pd.DataFrame:
+    """Load cached NOAA ENSO, or download+parse+cache when ``refresh`` or missing.
+
+    ``timings`` (optional mutable dict) is filled with per-stage seconds under
+    keys ``download``, ``parse``, ``write`` so callers can report where time
+    goes. It is only populated on the download path (cache hit returns ~0s and
+    writes nothing).
+    """
     if processed_path.exists() and not refresh:
         df = pd.read_csv(processed_path, parse_dates=["date"])
         required = {"date", "nino34"}
@@ -83,11 +93,22 @@ def load_or_download_noaa_enso(
             )
         return df.sort_values("date").reset_index(drop=True)
 
+    t0 = time.perf_counter()
     raw_text = download_noaa_enso_text(url=url, timeout=timeout)
+    if timings is not None:
+        timings["download"] = round(time.perf_counter() - t0, 3)
+
+    t1 = time.perf_counter()
     parsed = parse_noaa_nino34_table(raw_text)
+    if timings is not None:
+        timings["parse"] = round(time.perf_counter() - t1, 3)
 
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     processed_path.parent.mkdir(parents=True, exist_ok=True)
+    t2 = time.perf_counter()
     raw_path.write_text(raw_text, encoding="utf-8")
     parsed.to_csv(processed_path, index=False)
+    if timings is not None:
+        timings["write"] = round(time.perf_counter() - t2, 3)
+
     return parsed

@@ -51,6 +51,50 @@ def _session_base_dir() -> Path:
     return st.session_state["base_dir"]
 
 
+def _new_retrainer():
+    """Lazily create the BackgroundRetrainer (import kept out of module top to
+    avoid pulling the pipeline at import time)."""
+    from src.agent.data_freshness import BackgroundRetrainer
+
+    return BackgroundRetrainer()
+
+
+def _maybe_swap_retrain(retrainer, ctx, tools) -> None:
+    """At turn start: adopt a finished background retrain's results, if any.
+
+    The worker wrote ``enso_results.json`` + ``enso_predictions.csv`` to the
+    session's outputs dir; we reload them into ctx so the upcoming turn sees
+    fresh data + fresh model metrics. No-op when nothing has finished. Also
+    surfaces a toast and, if the data is still stale, kicks off another refresh.
+    """
+    import pandas as pd
+
+    output = retrainer.take_completed()
+    if output is not None:
+        # output is an EnsoForecastOutput (results + paths + enso df).
+        ctx.enso = output.enso
+        ctx.results = output.results
+        ctx.enso_results_path = output.results_path
+        ctx.predictions_path = output.predictions_path
+        ctx.predictions = pd.read_csv(output.predictions_path, parse_dates=["date"])
+        ctx.enso_data_source = "noaa"
+        ctx.enhanced_results = None  # invalidate; enhanced depends on the old series
+        ctx.cnn_forecasts = None  # CNN cache is mode-bound, not series-bound; clear to be safe
+        st.toast("✅ 后台 NOAA 刷新 + 模型重训完成，已载入最新数据。")
+
+    # Freshness self-check: if the loaded data is stale AND no retrain is
+    # running, kick one off in the background so the *next* turn has fresh data.
+    if ctx.enso is not None and ctx.results is not None:
+        used = ctx.results.get("data_source", {}).get("used", "")
+        if used in {"noaa", "auto", "user"}:
+            from src.agent.data_freshness import is_stale
+
+            data_through = pd.Timestamp(ctx.enso["date"].max()).strftime("%Y-%m")
+            if is_stale(data_through) and not retrainer.running:
+                if retrainer.start_if_idle(base_dir=ctx.base_dir):
+                    st.toast("⏳ 数据偏旧，后台正在刷新 NOAA + 重训模型…")
+
+
 def _get_messages() -> list[dict]:
     if "messages" not in st.session_state:
         st.session_state["messages"] = init_messages(SYSTEM_PROMPT)
@@ -139,6 +183,13 @@ def main() -> None:
     tools = st.session_state["tools"]
     ctx = st.session_state["ctx"]
     client = _resolve_client(api_key, model_choice)
+
+    # Background async retrain handoff: if a prior turn kicked off a NOAA refresh
+    # + retrain in a worker thread, swap its freshly-written results into ctx now
+    # (a few-ms disk read) before this turn runs. The worker only wrote files, so
+    # there's no race with run_turn. Also surface a toast when it completes.
+    retrainer = st.session_state.setdefault("retrainer", _new_retrainer())
+    _maybe_swap_retrain(retrainer, ctx, tools)
 
     messages = _get_messages()
 

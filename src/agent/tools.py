@@ -20,7 +20,7 @@ import pandas as pd
 
 from src.analysis.enso_phase import classify_enso_phase
 from src.analysis.precipitation_analysis import analyze_precipitation_by_enso_phase
-from src.config import ACC_LOW_CONF, ACC_REFUSE, DEFAULT_LEADS, DEFAULT_NINO12_URL, DEFAULT_NOAA_NINO34_URL, DEFAULT_SOI_URL, FIGURES_DIR, OUTPUTS_DIR, PROJECT_ROOT, SAMPLE_DATA_DIR
+from src.config import ACC_LOW_CONF, ACC_REFUSE, DEFAULT_LEADS, DEFAULT_NINO12_URL, DEFAULT_NOAA_NINO34_URL, DEFAULT_SOI_URL, ENSO_STALE_MONTHS, FIGURES_DIR, OUTPUTS_DIR, PROJECT_ROOT, SAMPLE_DATA_DIR
 from src.data.loaders import load_enso_csv, load_precipitation_csv, load_tide_csv
 from src.data.source_registry import IndexLoadError, list_sources, load_index as _registry_load_index
 from src.features.enso_features import make_enso_supervised_table
@@ -402,6 +402,16 @@ def _data_provenance_prefix(ctx: ToolContext, *, track: str) -> str:
     r1 = pd.Timestamp(ctx.enso["date"].max()).strftime("%Y-%m")
     rows = len(ctx.enso)
     head = f"[数据来源] {label}：{url} ｜ 时间范围 {r0} 至 {r1}（截止月=预测起算点）｜ 样本 {rows} 行"
+    # Data-freshness self-check: the cutoff month IS the forecast baseline, so a
+    # stale series degrades every prediction. Append a freshness tag so the
+    # agent (and user) sees it on every forecast. Only checked for real-source
+    # tracks (noaa/auto/user); sample data is synthetic and "freshness" is N/A.
+    if used in {"noaa", "auto", "user"}:
+        from src.agent.data_freshness import is_stale
+        if is_stale(r1):
+            from src.agent.data_freshness import data_age_months
+            age = data_age_months(r1)
+            head += f" ｜ ⚠️ 数据偏旧（距今 {age} 个月，超过 {ENSO_STALE_MONTHS} 个月阈值），建议刷新 load_enso_data(refresh_noaa=True)"
     if info.get("fallback_reason"):
         head += f" ｜ 回退原因：{info['fallback_reason']}"
 
