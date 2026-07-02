@@ -57,24 +57,30 @@ def _get_messages() -> list[dict]:
     return st.session_state["messages"]
 
 
-def _resolve_client(api_key: str):
-    """Return a DeepSeekClient or None (no key -> disabled chat).
+def _resolve_client(api_key: str, model_choice: str):
+    """Return an LLM client or None (no key -> disabled chat).
 
-    Key priority: sidebar input > Streamlit secrets > DEEPSEEK_API_KEY env.
-    The secrets path is for cloud deployment (Streamlit Community Cloud),
-    where there is no shell env var; locally it is absent and falls through.
+    ``model_choice`` selects the backend ("DeepSeek" or "GLM"); each resolves
+    its key with priority: sidebar input > Streamlit secrets > env var. The
+    secrets path is for cloud deployment where there is no shell env var.
     """
     key = (api_key or "").strip()
+    env_name = "DEEPSEEK_API_KEY" if model_choice == "DeepSeek" else "GLM_API_KEY"
+    secret_name = "DEEPSEEK_API_KEY" if model_choice == "DeepSeek" else "GLM_API_KEY"
     if not key:
         try:
-            key = st.secrets.get("DEEPSEEK_API_KEY", "")
+            key = st.secrets.get(secret_name, "")
         except Exception:  # noqa: BLE001 — st.secrets raises if no secrets file
             key = ""
     if not key:
-        key = os.environ.get("DEEPSEEK_API_KEY", "")
+        key = os.environ.get(env_name, "")
     if not key:
         return None
     try:
+        if model_choice == "GLM":
+            from src.agent.glm_client import GLMClient
+
+            return GLMClient(api_key=key)
         return DeepSeekClient(api_key=key)
     except DeepSeekError:
         return None
@@ -111,7 +117,9 @@ def main() -> None:
 
     with st.sidebar:
         st.header("配置")
-        api_key = st.text_input("DeepSeek API Key", type="password",
+        model_choice = st.radio("LLM 后端", ["DeepSeek", "GLM"], index=0,
+                                help="DeepSeek 默认；GLM(智谱)国内直连更稳，可切换对比")
+        api_key = st.text_input(f"{model_choice} API Key", type="password",
                                 placeholder="留空读环境变量")
         uploaded = st.file_uploader("上传 ENSO CSV（date+nino34 列）", type=["csv"],
                                     help="上传后会得到路径，让 agent 用 load_user_enso 加载")
@@ -130,7 +138,7 @@ def main() -> None:
         st.session_state["tools"] = build_tools(st.session_state["ctx"])
     tools = st.session_state["tools"]
     ctx = st.session_state["ctx"]
-    client = _resolve_client(api_key)
+    client = _resolve_client(api_key, model_choice)
 
     messages = _get_messages()
 

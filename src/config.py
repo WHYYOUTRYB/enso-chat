@@ -50,11 +50,19 @@ DEFAULT_RANDOM_SEED = 42
 # deepseek-chat supports function calling; deepseek-reasoner does NOT.
 DEEPSEEK_API_URL = "https://api.deepseek.com"
 DEEPSEEK_CHAT_PATH = "/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEEPSEEK_BASE_URL_ENV = "DEEPSEEK_BASE_URL"
 DEEPSEEK_MODEL_ENV = "DEEPSEEK_MODEL"
 AGENT_REQUEST_TIMEOUT = 120.0
+
+# --- GLM (Zhipu BigModel) LLM client ---
+# OpenAI-compatible endpoint; supports function calling with the same tools/
+# tool_calls/tool_call_id schema as DeepSeek, so the agent loop is unchanged.
+GLM_API_URL = "https://open.bigmodel.cn/api/paas/v4"
+GLM_CHAT_PATH = "/chat/completions"
+GLM_MODEL = "glm-4.6"
+GLM_API_KEY_ENV = "GLM_API_KEY"
 
 # --- Agent loop robustness ---
 # _chat_with_retry retries transient DeepSeek errors (429/5xx/network) with
