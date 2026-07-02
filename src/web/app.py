@@ -175,6 +175,10 @@ def main() -> None:
         if st.button("🗑️ 清空对话"):
             st.session_state["messages"] = init_messages(SYSTEM_PROMPT)
             st.rerun()
+        st.divider()
+        st.caption("河海大学 海洋技术专业 · 韩烁小组")
+        st.caption("成员：韩烁 张佳赢 栗一润 李孟航 刘荣双 韦邦贤")
+        st.caption("GitHub: github.com/WHYYOUTRYB")
 
     # Lazy-init shared tool context (persists across turns).
     if "ctx" not in st.session_state:
