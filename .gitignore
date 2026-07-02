@@ -11,6 +11,7 @@ reports/figures/*.png
 reports/outputs/*.json
 reports/outputs/*.md
 reports/outputs/*.csv
+reports/forecasts/
 .streamlit/secrets.toml
 # Reference notebooks (external study material, not part of the project)
 参考/

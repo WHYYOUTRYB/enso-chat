@@ -20,7 +20,7 @@ import pandas as pd
 
 from src.analysis.enso_phase import classify_enso_phase
 from src.analysis.precipitation_analysis import analyze_precipitation_by_enso_phase
-from src.config import ACC_LOW_CONF, ACC_REFUSE, DEFAULT_LEADS, FIGURES_DIR, OUTPUTS_DIR, PROJECT_ROOT, SAMPLE_DATA_DIR
+from src.config import ACC_LOW_CONF, ACC_REFUSE, DEFAULT_LEADS, DEFAULT_NINO12_URL, DEFAULT_NOAA_NINO34_URL, DEFAULT_SOI_URL, FIGURES_DIR, OUTPUTS_DIR, PROJECT_ROOT, SAMPLE_DATA_DIR
 from src.data.loaders import load_enso_csv, load_precipitation_csv, load_tide_csv
 from src.data.source_registry import IndexLoadError, list_sources, load_index as _registry_load_index
 from src.features.enso_features import make_enso_supervised_table
@@ -369,6 +369,62 @@ HINDCAST_REPORT_PATH = OUTPUTS_DIR / "cnn_lstm_hindcast.json"
 REALTIME_HINDCAST_REPORT_PATH = OUTPUTS_DIR / "cnn_lstm_realtime_hindcast.json"
 
 
+# Provenance labels + URLs for the Niño3.4 data_source values that appear in
+# ctx.results["data_source"]["used"]. Used by _data_provenance_prefix so every
+# forecast tool leads with where the data came from — not fabricated, read from
+# the real config knobs + ctx state.
+_NINO34_SOURCE_INFO: dict[str, tuple[str, str]] = {
+    "noaa": ("NOAA/PSL Niño3.4 月值时序", DEFAULT_NOAA_NINO34_URL),
+    "auto": ("NOAA/PSL Niño3.4 月值时序（auto=NOAA优先，失败回退sample）", DEFAULT_NOAA_NINO34_URL),
+    "sample": ("项目内置样本数据（无网兜底，合成 ENSO 序列）", "(本地 data/sample/sample_enso.csv)"),
+    "user": ("用户上传 CSV", "(用户在侧栏上传)"),
+    # enhanced-only fallback buckets:
+    "nino34_only_fallback": ("NOAA/PSL Niño3.4（外源指数不可用，退化为 nino34-only）", DEFAULT_NOAA_NINO34_URL),
+    "enhanced": ("NOAA/PSL Niño3.4 + 外源（SOI/Niño1+2）", DEFAULT_NOAA_NINO34_URL),
+}
+
+
+def _data_provenance_prefix(ctx: ToolContext, *, track: str) -> str:
+    """A one-line provenance header prepended to every forecast tool's output.
+
+    Names the data source + URL, the time range (start..through, the latter is
+    the forecast baseline), the row count, and track-specific source info (the
+    enhanced track's exog indices; the CNN-LSTM track's mode + source). Reads
+    only real ctx state — nothing invented. Returns an empty string if no ENSO
+    data has been loaded yet (caller will have errored anyway).
+    """
+    if ctx.enso is None or ctx.results is None:
+        return ""
+    info = ctx.results.get("data_source", {})
+    used = info.get("used", "?")
+    label, url = _NINO34_SOURCE_INFO.get(used, (used, "?"))
+    r0 = pd.Timestamp(ctx.enso["date"].min()).strftime("%Y-%m")
+    r1 = pd.Timestamp(ctx.enso["date"].max()).strftime("%Y-%m")
+    rows = len(ctx.enso)
+    head = f"[数据来源] {label}：{url} ｜ 时间范围 {r0} 至 {r1}（截止月=预测起算点）｜ 样本 {rows} 行"
+    if info.get("fallback_reason"):
+        head += f" ｜ 回退原因：{info['fallback_reason']}"
+
+    if track == "enhanced":
+        er = ctx.enhanced_results or {}
+        exog = er.get("_exog_used", [])
+        if exog:
+            exog_urls = []
+            if "soi" in exog:
+                exog_urls.append(f"SOI={DEFAULT_SOI_URL}")
+            if "nino12" in exog:
+                exog_urls.append(f"Niño1+2={DEFAULT_NINO12_URL}")
+            head += f" ｜ 外源指数 {exog}（" + ", ".join(exog_urls) + "）"
+        else:
+            head += " ｜ 外源指数不可用（已退化）"
+
+    if track == "cnn_lstm" and ctx.cnn_forecasts is not None:
+        mode = ctx.cnn_forecasts.get("mode", "?")
+        src = ctx.cnn_forecasts.get("source", "?")
+        head += f" ｜ CNN-LSTM mode={mode}，输入源：{src}"
+    return head + "\n"
+
+
 def _forecast_cnn_lstm(ctx: ToolContext, lead: int, mode: str = "soda_tail") -> str:
     """Run the CNN-LSTM forward pass for one lead (1..24).
 
@@ -396,7 +452,8 @@ def _forecast_cnn_lstm(ctx: ToolContext, lead: int, mode: str = "soda_tail") -> 
             entry = leads.get(str(lead)) or leads.get(lead)
             src = ctx.cnn_forecasts.get("source", "?")
             we = ctx.cnn_forecasts.get("window_end", "?")
-            return f"lead={lead}: value={entry['value']}, phase={entry['phase']} (CNN-LSTM, cached). source={src}, window_end={we}."
+            prefix = _data_provenance_prefix(ctx, track="cnn_lstm") if ctx.cnn_forecasts is not None else ""
+            return prefix + f"lead={lead}: value={entry['value']}, phase={entry['phase']} (CNN-LSTM, cached). source={src}, window_end={we}."
 
     # Lazy import: torch is a heavy, training-only dep — don't fail `import tools`.
     try:
@@ -473,7 +530,8 @@ def _forecast_cnn_lstm(ctx: ToolContext, lead: int, mode: str = "soda_tail") -> 
         guide = " [可靠性请调 report_realtime_skill(lead="
         guide += f"{lead}) 查跨域 ACC，勿用 report_hindcast_skill]"
     return (
-        f"lead={lead}: value={entry['value']}, phase={entry['phase']} "
+        _data_provenance_prefix(ctx, track="cnn_lstm")
+        + f"lead={lead}: value={entry['value']}, phase={entry['phase']} "
         f"(CNN-LSTM, spatial sst/t300/ua/va, mode={mode}). source={source}. {note}{guide}"
     )
 
@@ -649,6 +707,7 @@ def _forecast_enhanced(
     res = ctx.enhanced_results
     exog_used = res.get("_exog_used", [])
     fallback = res.get("_fallback", False)
+    provenance = _data_provenance_prefix(ctx, track="enhanced")
 
     last_date = pd.Timestamp(ctx.enso["date"].max())
     lead = _compute_lead(last_date, target_year, target_month)
@@ -660,7 +719,7 @@ def _forecast_enhanced(
         exog_tag = " exog=UNAVAILABLE(fallback nino34-only)"
 
     if lead <= 0:
-        return f"target={target} (lead={lead}): at or before latest data ({last_iso}); no forecast needed.{exog_tag}"
+        return provenance + f"target={target} (lead={lead}): at or before latest data ({last_iso}); no forecast needed.{exog_tag}"
 
     if str(lead) in res["latest_forecast"]:
         fc = res["latest_forecast"][str(lead)]
@@ -668,9 +727,10 @@ def _forecast_enhanced(
         acc = res["leads"][str(lead)][best].get("acc", 0.0)
         conf, tag = _confidence_from_acc(acc)
         if conf == "refuse":
-            return f"target={target} lead={lead} (enhanced, cached): refusing — ACC={acc:.2f} below reliable range. Recommend a shorter lead or refresh data.{exog_tag}"
+            return provenance + f"target={target} lead={lead} (enhanced, cached): refusing — ACC={acc:.2f} below reliable range. Recommend a shorter lead or refresh data.{exog_tag}"
         return (
-            f"target={target} lead={lead} (enhanced, cached): value={fc['value']}, "
+            provenance
+            + f"target={target} lead={lead} (enhanced, cached): value={fc['value']}, "
             f"phase={fc['phase']}, model={fc['model']}, acc={acc:.2f}, "
             f"data_through={last_iso}.{tag}{exog_tag}"
         )
@@ -685,9 +745,10 @@ def _forecast_enhanced(
     value, phase, acc = got
     conf, tag = _confidence_from_acc(acc)
     if conf == "refuse":
-        return f"target={target} lead={lead} (enhanced, on-the-fly): refusing — ACC={acc:.2f} below reliable range.{exog_tag}"
+        return provenance + f"target={target} lead={lead} (enhanced, on-the-fly): refusing — ACC={acc:.2f} below reliable range.{exog_tag}"
     return (
-        f"target={target} lead={lead} (enhanced, on-the-fly): value={round(value,4)}, "
+        provenance
+        + f"target={target} lead={lead} (enhanced, on-the-fly): value={round(value,4)}, "
         f"phase={phase}, model=random_forest, acc={acc:.2f}, data_through={last_iso}.{tag}{exog_tag}"
     )
 
@@ -736,7 +797,7 @@ def _compare_methods(
 
     lines = [f"Method comparison for target={target}:", f"- baseline (Ridge/RF, nino34-only): {baseline}",
              f"- enhanced (Ridge/RF + SOI/Niño1+2): {enhanced}", f"- {cnn_line}"]
-    return "\n".join(lines)
+    return _data_provenance_prefix(ctx, track="compare") + "\n".join(lines)
 
 
 def _report_hindcast_skill(ctx: ToolContext, lead: int | None = None) -> str:
@@ -894,22 +955,23 @@ def _forecast_for_month(
     lead = _compute_lead(last_date, target_year, target_month)
     target = f"{target_year}-{target_month:02d}"
     last_iso = last_date.strftime("%Y-%m")
+    provenance = _data_provenance_prefix(ctx, track="baseline")
 
     if lead <= 0:
-        return (
+        return provenance + (
             f"target={target} (lead={lead}): target month is at or before the latest data "
             f"({last_iso}); no forecast needed (data already covers it)."
         )
 
     if str(lead) in ctx.results["latest_forecast"]:
         fc = ctx.results["latest_forecast"][str(lead)]
-        return (
+        return provenance + (
             f"target={target} lead={lead} (cached): value={fc['value']}, "
             f"phase={fc['phase']}, model={fc['model']}, data_through={last_iso}."
         )
 
     if lead >= _HARD_WARN_LEAD:
-        return (
+        return provenance + (
             f"target={target} requires lead={lead} months (data through {last_iso}). "
             f"This exceeds the reliable forecast range (lead < {_HARD_WARN_LEAD}); "
             f"ENSO predictability decays sharply past ~6 months. "
@@ -920,7 +982,7 @@ def _forecast_for_month(
     fc = _forecast_value_for_lead(ctx, lead)
     confidence = "low_confidence" if lead >= _LOW_CONF_LEAD else "normal"
     tag = " [低可信度/low_confidence: lead>=7, treat as indicative only]" if lead >= _LOW_CONF_LEAD else ""
-    return (
+    return provenance + (
         f"target={target} lead={lead} (trained on the fly, confidence={confidence}): "
         f"value={fc['value']}, phase={fc['phase']}, model={fc['model']}, "
         f"data_through={last_iso}.{tag}"
@@ -1040,6 +1102,132 @@ def recommend_data_range_dict(
         "recommendation": recommendation,
         "allow_run": bucket not in {"past", "out_of_range"},
     }
+
+
+def _write_forecast_report(ctx: ToolContext, target_label: str = "") -> str:
+    """Assemble a Markdown ENSO forecast report from results already on the ctx.
+
+    Pure-deterministic assembly: every number in the report is read from the
+    real cached tool outputs (``ctx.results`` / ``ctx.enhanced_results`` /
+    ``ctx.cnn_forecasts`` / the precomputed hindcast JSONs); the LLM never fills
+    in any value, so nothing can be fabricated. Tracks the user never ran are
+    flagged ``未运行`` rather than guessed.
+
+    ``target_label`` is a free-text label (e.g. "2027年3月 Niño3.4") for the
+    report header only — it is a label, never a numeric result.
+
+    Generated figures (``ctx.figure_paths``) are copied into a ``figures/``
+    subfolder next to the report and embedded by relative path. Returns the
+    report path, the figures dir, and the figure count.
+    """
+    from src.reports.forecast_report import generate_forecast_report
+
+    if ctx.results is None and ctx.enhanced_results is None and ctx.cnn_forecasts is None:
+        return (
+            "Error: no forecast results on the context yet. Run at least one of "
+            "load_enso_data / forecast_enhanced / forecast_cnn_lstm (and the plot_* "
+            "tools for figures) before writing a report."
+        )
+    bundle = generate_forecast_report(ctx, target_label=target_label)
+    ctx.report_path = bundle.report_path
+    return (
+        f"Report written: {bundle.report_path.as_posix()} "
+        f"({bundle.figure_count} figure(s) embedded in {bundle.figures_dir.as_posix()}). "
+        f"Tell the user the path so they can open / download it.")
+
+
+def _read_report(ctx: ToolContext, report_path: str | None = None) -> str:
+    """Return the full Markdown of a written report (for academic-polish editing).
+
+    The agent uses this to obtain the draft, rephrase the 引言/结论 academic
+    prose, add 摘要 关键词, then submit the polished version via
+    ``accept_report_polish`` — which enforces the numeric guard. The agent must
+    follow the constraints in SYSTEM_PROMPT (no number/table/figure/command/path
+    changes, no external references) because the guard will reject any numeric
+    drift.
+    """
+    from pathlib import Path as _Path
+
+    path = _Path(report_path) if report_path else ctx.report_path
+    if path is None or not path.exists():
+        return (
+            "Error: no report to read. Run write_forecast_report first, or pass "
+            "report_path=<path>."
+        )
+    return path.read_text(encoding="utf-8")
+
+
+def _accept_report_polish(
+    ctx: ToolContext, polished_markdown: str, report_path: str | None = None
+) -> str:
+    """Accept an LLM-polished report only if every numeric token is preserved.
+
+    The numeric guard (:func:`diff_numbers`) compares the polished text against
+    the on-disk draft. If ANY number changed, the polish is **rejected** and the
+    draft is left untouched — so “数据真实” holds even after an LLM rewrites the
+    prose. On success, the polished Markdown overwrites the draft in place.
+
+    The caller (the agent) is responsible for only changing 引言/结论 language
+    and adding 摘要 关键词; this guard is the safety net, not the only line of
+    defense.
+    """
+    from pathlib import Path as _Path
+    from src.reports.forecast_report import diff_numbers
+
+    path = _Path(report_path) if report_path else ctx.report_path
+    if path is None or not path.exists():
+        return (
+            "Error: no report to overwrite. Run write_forecast_report first, or "
+            "pass report_path=<path>."
+        )
+    draft = path.read_text(encoding="utf-8")
+    changed = diff_numbers(draft, polished_markdown)
+    if changed:
+        return (
+            f"Polish REJECTED — {len(changed)} numeric token(s) differ "
+            f"(e.g. {changed[:8]}). Draft left UNTOUCHED. 数据真实 守恒失败。"
+            "Reread the report via read_report, change ONLY the prose of 引言/结论 "
+            "and add 关键词, keep every number/table/figure/command exactly as-is, "
+            "then retry accept_report_polish."
+        )
+    path.write_text(polished_markdown, encoding="utf-8")
+    return f"Polish accepted — academic prose updated, all numbers preserved. {path.as_posix()}"
+
+
+def _explain_component(ctx: ToolContext, name: str = "") -> str:
+    """Self-description: explain how a registered component is implemented.
+
+    Returns a structured summary (responsibility / key symbols / dependencies /
+    source file) drawn from a hand-authored table grounded in the real repo —
+    no fabrication. With no ``name``, lists every registered component grouped
+    by layer so the agent can pick. Follow up with ``read_source`` for
+    function-level code. ``ctx`` is unused but kept for the tool-handler
+    signature.
+    """
+    from src.agent.code_guide import explain_component
+
+    return explain_component(name)
+
+
+def _read_source(
+    ctx: ToolContext,
+    file_path: str,
+    symbol: str | None = None,
+    start: int | None = None,
+    end: int | None = None,
+) -> str:
+    """Read the agent's own source code from the repo, with line numbers.
+
+    Sandbox-limited to the project root (no traversal escapes). ``symbol``
+    locates a ``def``/``class`` block; ``start``/``end`` give a 1-indexed line
+    range; with neither, returns the whole file. Hard-capped at
+    ``MAX_SOURCE_CHARS`` so a 1500-line module never floods the context. Use
+    after ``explain_component`` to discuss how a specific function/class is
+    implemented. ``ctx`` is unused but kept for the handler signature.
+    """
+    from src.agent.code_guide import read_source
+
+    return read_source(file_path, symbol=symbol, start=start, end=end)
 
 
 def _recommend_data_range(ctx: ToolContext, target_year: int, target_month: int) -> str:
@@ -1393,6 +1581,138 @@ def build_tools(ctx: ToolContext) -> ToolRegistry:
                 "additionalProperties": False,
             },
             fn=lambda target_year, target_month: _recommend_data_range(ctx, target_year, target_month),
+        ),
+        Tool(
+            name="write_forecast_report",
+            description=(
+                "Assemble a Markdown ENSO forecast report from the results already produced "
+                "this conversation (basic Ridge/RF track, enhanced SOI/Niño1+2 track, CNN-LSTM "
+                "track, generated figures, hindcast skill). **Every number in the report is read "
+                "from the real tool outputs — nothing is fabricated.** Tracks the user never ran "
+                "are flagged 未运行. Use this when the user asks to 生成预测报告/撰写报告/写一篇 "
+                "ENSO 报告/出报告. Call it AFTER running the forecast/plot tools so the report has "
+                "real content. The target_label is a free-text header label (e.g. "
+                "'2027年3月 Niño3.4'), not a numeric forecast value — leave blank if unsure."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_label": {
+                        "type": "string",
+                        "description": "Free-text label for the forecast target, shown in the report header only.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            fn=lambda target_label="": _write_forecast_report(ctx, target_label),
+        ),
+        Tool(
+            name="read_report",
+            description=(
+                "Read the full Markdown of a report previously written by "
+                "write_forecast_report, returning it for academic-prose polishing. "
+                "Use before accept_report_polish so you can rephrase the 引言/结论 "
+                "and add 摘要 关键词. Defaults to the most recent report on the "
+                "session (ctx.report_path); pass report_path to target a specific one."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "report_path": {
+                        "type": "string",
+                        "description": "Optional explicit report file path; defaults to the last written report.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            fn=lambda report_path=None: _read_report(ctx, report_path),
+        ),
+        Tool(
+            name="accept_report_polish",
+            description=(
+                "Write an LLM-polished version of the report back to disk — ONLY if "
+                "every numeric token is unchanged (the tool enforces this and rejects "
+                "the polish otherwise, leaving the draft untouched). Use after "
+                "read_report, having modified ONLY 引言/结论 academic prose and added "
+                "摘要 关键词 (see SYSTEM_PROMPT constraints). The full polished Markdown "
+                "goes in `polished_markdown`."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "polished_markdown": {
+                        "type": "string",
+                        "description": "The full polished Markdown report (all sections, tables, figures, commands).",
+                    },
+                    "report_path": {
+                        "type": "string",
+                        "description": "Optional explicit report file path; defaults to the last written report.",
+                    },
+                },
+                "required": ["polished_markdown"],
+                "additionalProperties": False,
+            },
+            fn=lambda polished_markdown, report_path=None: _accept_report_polish(
+                ctx, polished_markdown, report_path
+            ),
+        ),
+        Tool(
+            name="explain_component",
+            description=(
+                "Explain how a component of this project is implemented — returns a "
+                "structured summary (responsibility, key symbols/classes, dependencies, "
+                "source file path) drawn from the real repo (no fabrication). Use when "
+                "the user asks how some part works / 怎么实现 / 讲一下 X 模块 / 介绍架构. "
+                "Pass name like 'agent.run_turn', 'models.cnn_lstm', 'data.realtime_fetch' "
+                "(use the dotted module key). With empty name, lists every registered "
+                "component grouped by layer so you can pick. Follow up with read_source for "
+                "function-level code."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Component key, e.g. 'agent.run_turn'. Empty lists all.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            fn=lambda name="": _explain_component(ctx, name),
+        ),
+        Tool(
+            name="read_source",
+            description=(
+                "Read real source code from this repo with line numbers. Use after "
+                "explain_component to discuss how a specific function/class is implemented, "
+                "or to answer 'show me the code of X'. Pass an absolute or repo-relative "
+                "file_path; optionally a symbol (def/class name) to locate just that block, "
+                "or start/end for a 1-indexed line range. Output is hard-capped to stay "
+                "context-safe; for large files use start/end to page through."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Repo-relative or absolute path, sandboxed to project root.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional def/class name to locate and return as a block.",
+                    },
+                    "start": {"type": "integer", "description": "Optional 1-indexed start line."},
+                    "end": {"type": "integer", "description": "Optional 1-indexed end line (inclusive)."},
+                },
+                "required": ["file_path"],
+                "additionalProperties": False,
+            },
+            fn=lambda file_path, symbol=None, start=None, end=None: _read_source(
+                ctx, file_path, symbol, start, end
+            ),
         ),
     ]
     return ToolRegistry(tools)
